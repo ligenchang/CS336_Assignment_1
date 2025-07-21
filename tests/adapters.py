@@ -433,7 +433,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    from cs336_basics import softmax
+    return softmax(in_features, dim)
 
 
 def run_cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]) -> Float[Tensor, ""]:
@@ -449,7 +450,8 @@ def run_cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: 
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    from cs336_basics import cross_entropy
+    return cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -461,7 +463,8 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    from cs336_basics import gradient_clipping
+    gradient_clipping(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> type[torch.optim.Optimizer]:
