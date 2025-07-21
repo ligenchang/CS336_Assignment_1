@@ -1,7 +1,7 @@
 import os
 import collections
 import regex as re
-from typing import List, Tuple, Dict, Union, BinaryIO
+from typing import List, Tuple, Dict, Union, BinaryIO, Set, DefaultDict, Counter
 import pathlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -85,7 +85,74 @@ def parallel_pretokenize(filename: str, special_tokens: List[str], num_workers: 
             word_freqs.update(future.result())
     return word_freqs
 
+class PairCounter:
+    """
+    Efficient pair counter that maintains pair frequencies and updates them incrementally.
+    Similar to the approach used in tiktoken, this avoids recomputing all pair counts after each merge.
+    """
+    def __init__(self, word_freqs: Counter, skipped_pairs: Set[Tuple] = None):
+        self.pair_freqs = collections.defaultdict(int)
+        self.skipped_pairs = skipped_pairs or set()
+        
+        # Initialize pair counts directly - skip the word_pair_positions mapping for speed
+        for word, freq in word_freqs.items():
+            if len(word) <= 1:
+                continue
+            for i in range(len(word) - 1):
+                pair = (word[i], word[i + 1])
+                if pair not in self.skipped_pairs:
+                    self.pair_freqs[pair] += freq
+    
+    def update_pairs(self, best_pair: Tuple, old_words: Dict[Tuple, int], new_words: Dict[Tuple, int]) -> None:
+        """
+        Fast update of pair frequencies after a merge.
+        Only updates counts for pairs that could have changed.
+        """
+        bp0, bp1 = best_pair
+        merged = bp0 + bp1
+        
+        # Decrement counts for pairs in old words
+        for word, freq in old_words.items():
+            if len(word) <= 1:
+                continue
+                
+            # Find all adjacent pairs in the word and decrement their counts
+            for i in range(len(word) - 1):
+                pair = (word[i], word[i + 1])
+                if pair not in self.skipped_pairs and pair in self.pair_freqs:
+                    self.pair_freqs[pair] -= freq
+                    if self.pair_freqs[pair] <= 0:
+                        del self.pair_freqs[pair]
+        
+        # Increment counts for pairs in new words
+        for word, freq in new_words.items():
+            if len(word) <= 1:
+                continue
+                
+            # Find all adjacent pairs in the word and increment their counts
+            for i in range(len(word) - 1):
+                pair = (word[i], word[i + 1])
+                if pair not in self.skipped_pairs:
+                    self.pair_freqs[pair] += freq
+    
+    def get_best_pair(self) -> Tuple[Tuple, int]:
+        """Get the most frequent pair."""
+        if not self.pair_freqs:
+            return None, 0
+            
+        max_freq = max(self.pair_freqs.values())
+        best_pairs = [p for p, freq in self.pair_freqs.items() if freq == max_freq]
+        best_pair = max(best_pairs)
+        return best_pair, max_freq
+    
+    def add_skipped_pair(self, pair: Tuple) -> None:
+        """Add a pair to the skipped set and remove it from frequencies."""
+        self.skipped_pairs.add(pair)
+        if pair in self.pair_freqs:
+            del self.pair_freqs[pair]
+
 def count_pairs(word_freqs, skipped_pairs):
+    """Legacy method maintained for compatibility."""
     pair_freqs = collections.defaultdict(int)
     for word, freq in word_freqs.items():
         for i in range(len(word) - 1):
@@ -124,14 +191,35 @@ import time
 def apply_merge_fast(word_freqs, best_pair, protected_words):
     bp0, bp1 = best_pair
     merged_token = bp0 + bp1
-    new_word_freqs = collections.Counter()
+    new_word_freqs = {}  # Use regular dict instead of Counter for speed
     merged_count = 0
+    # Only track words that were actually modified
+    changed_words = {}
+    
+    # Fast lookup for protected words
+    protected_set = set(protected_words)
 
     for word, freq in word_freqs.items():
-        if word in protected_words:
-            new_word_freqs[word] += freq
+        if word in protected_set:
+            new_word_freqs[word] = freq
             continue
 
+        # Check if this word contains the pair we're merging
+        contains_pair = False
+        for i in range(len(word) - 1):
+            if word[i] == bp0 and word[i + 1] == bp1:
+                contains_pair = True
+                break
+                
+        if not contains_pair:
+            # If the word doesn't contain the pair, keep it as is
+            new_word_freqs[word] = freq
+            continue
+            
+        # If we're here, the word contains the pair to merge
+        changed_words[word] = freq
+        
+        # Perform the merge
         new_word = []
         i = 0
         while i < len(word):
@@ -142,9 +230,14 @@ def apply_merge_fast(word_freqs, best_pair, protected_words):
             else:
                 new_word.append(word[i])
                 i += 1
-        new_word_freqs[tuple(new_word)] += freq
+        
+        new_word_tuple = tuple(new_word)
+        if new_word_tuple in new_word_freqs:
+            new_word_freqs[new_word_tuple] += freq
+        else:
+            new_word_freqs[new_word_tuple] = freq
 
-    return new_word_freqs, merged_count
+    return new_word_freqs, merged_count, changed_words
 
 def train_bpe(
     input_path: Union[str, pathlib.Path],
@@ -183,26 +276,23 @@ def train_bpe(
     skipped_pairs = set()
     merges = []
 
+    # Initialize pair counter with word frequencies
     start = time.perf_counter()
-    pair_freqs = count_pairs(word_freqs, skipped_pairs)
-    timings["first_pair_count"] = time.perf_counter() - start
+    pair_counter = PairCounter(word_freqs, skipped_pairs)
+    timings["init_pair_counter"] = time.perf_counter() - start
 
     merge_iterations = 0
     apply_merge_total_time = 0
-    count_pairs_total_time = 0
+    pair_update_total_time = 0
 
     while len(vocab) < vocab_size:
-        if not pair_freqs:
+        best_pair, max_freq = pair_counter.get_best_pair()
+        if not best_pair or max_freq == 0:
             break
-
-        max_freq = max(pair_freqs.values())
-        best_pairs = [p for p, freq in pair_freqs.items() if freq == max_freq]
-        best_pair = max(best_pairs)
 
         new_token = best_pair[0] + best_pair[1]
         if new_token in vocab_set:
-            skipped_pairs.add(best_pair)
-            pair_freqs.pop(best_pair, None)
+            pair_counter.add_skipped_pair(best_pair)
             continue
 
         vocab[next_id] = new_token
@@ -211,27 +301,38 @@ def train_bpe(
         next_id += 1
 
         merge_start = time.perf_counter()
-        word_freqs, total_merged = apply_merge_fast(word_freqs, best_pair, protected_words)
+        word_freqs_dict, total_merged, changed_words = apply_merge_fast(word_freqs, best_pair, protected_words)
         apply_merge_total_time += time.perf_counter() - merge_start
 
         if total_merged == 0:
-            skipped_pairs.add(best_pair)
-            pair_freqs.pop(best_pair, None)
+            pair_counter.add_skipped_pair(best_pair)
             continue
 
-        count_start = time.perf_counter()
-        pair_freqs = count_pairs(word_freqs, skipped_pairs)
-        count_pairs_total_time += time.perf_counter() - count_start
+        # Update pair counter incrementally with changed words
+        update_start = time.perf_counter()
+        
+        # Convert dict back to Counter if needed for compatibility
+        word_freqs = collections.Counter(word_freqs_dict)
+        
+        # Get the affected new words (those containing the merged token)
+        merged_token = best_pair[0] + best_pair[1]
+        affected_new_words = {}
+        for word, freq in word_freqs_dict.items():
+            if any(tok == merged_token for tok in word):
+                affected_new_words[word] = freq
 
+        # Only update pair frequencies for words that changed
+        pair_counter.update_pairs(best_pair, changed_words, affected_new_words)
+        pair_update_total_time += time.perf_counter() - update_start
         merge_iterations += 1
 
-    total_time = sum(timings.values()) + apply_merge_total_time + count_pairs_total_time
+    total_time = sum(timings.values()) + apply_merge_total_time + pair_update_total_time
 
     print("\n===== Timing Report =====")
     for k, v in timings.items():
         print(f"{k:25s}: {v:.4f} sec")
     print(f"apply_merge (total)      : {apply_merge_total_time:.4f} sec")
-    print(f"count_pairs (total)      : {count_pairs_total_time:.4f} sec")
+    print(f"pair_update (total)      : {pair_update_total_time:.4f} sec")
     print(f"merge iterations         : {merge_iterations}")
     print(f"total                    : {total_time:.4f} sec")
     print("=========================\n")
