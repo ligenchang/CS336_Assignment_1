@@ -100,18 +100,20 @@ def parallel_pretokenize(filename: str, special_tokens: List[str], num_workers: 
     
     # Process chunks in parallel
     word_freqs = collections.Counter()
+    for arg in args:
+        word_freqs.update(tokenize_chunk(*arg))
     
-    # For very small files, process directly without parallelization
-    if file_size < 500000:  # Less than 500KB
-        for arg in args:
-            word_freqs.update(tokenize_chunk(*arg))
-    else:
-        with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-            # Submit all tasks at once
-            futures = [executor.submit(tokenize_chunk, *arg) for arg in args]
-            # Process results as they complete
-            for future in as_completed(futures):
-                word_freqs.update(future.result())
+    # # For very small files, process directly without parallelization
+    # if file_size < 500000:  # Less than 500KB
+    #     for arg in args:
+    #         word_freqs.update(tokenize_chunk(*arg))
+    # else:
+    #     with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+    #         # Submit all tasks at once
+    #         futures = [executor.submit(tokenize_chunk, *arg) for arg in args]
+    #         # Process results as they complete
+    #         for future in as_completed(futures):
+    #             word_freqs.update(future.result())
     
     return word_freqs
 
