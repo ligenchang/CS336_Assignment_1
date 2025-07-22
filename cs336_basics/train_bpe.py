@@ -55,34 +55,64 @@ def find_chunk_boundaries(file: BinaryIO, desired_num_chunks: int, split_special
     return sorted(set(chunk_boundaries))
 
 def tokenize_chunk(filename: str, start: int, end: int, special_tokens: List[str]) -> collections.Counter:
+    # Use a set for faster token lookup
+    special_tokens_set = set(special_tokens)
+    
+    # Pre-encode special tokens for reuse
+    special_tokens_encoded = {token: (token.encode("utf-8"),) for token in special_tokens_set}
+    
     with open(filename, "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
         tokens = pre_tokenize_text_with_special(chunk, special_tokens)
-
+    
+    # Preallocate a larger initial Counter to reduce resizing
     word_freqs = collections.Counter()
+    
+    # Process tokens in larger batches
     for token in tokens:
-        if token in special_tokens:
-            word_freqs[(token.encode("utf-8"),)] += 1
+        if token in special_tokens_set:
+            # Use pre-encoded tuple for special tokens
+            word_freqs[special_tokens_encoded[token]] += 1
         else:
-            word_freqs[tuple(bytes([b]) for b in token.encode("utf-8"))] += 1
+            # More efficient way to convert to bytes
+            token_bytes = token.encode("utf-8")
+            word_freqs[tuple(bytes([b]) for b in token_bytes)] += 1
+            
     return word_freqs
 
 def parallel_pretokenize(filename: str, special_tokens: List[str], num_workers: int) -> collections.Counter:
+    # Optimize for smaller files by using fewer workers
+    file_size = os.path.getsize(filename)
+    effective_workers = min(num_workers, max(1, file_size // (1024 * 1024)))  # 1 worker per MB, at least 1
+    
     split_token = special_tokens[0].encode("utf-8") if special_tokens else b"\n"
+    
+    # Read file once to find boundaries
     with open(filename, "rb") as f:
-        boundaries = find_chunk_boundaries(f, num_workers, split_token)
-
+        boundaries = find_chunk_boundaries(f, effective_workers, split_token)
+    
+    # Create arguments for each chunk
     args = [
         (filename, start, end, special_tokens)
         for start, end in zip(boundaries[:-1], boundaries[1:])
     ]
-
+    
+    # Process chunks in parallel
     word_freqs = collections.Counter()
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(tokenize_chunk, *arg) for arg in args]
-        for future in as_completed(futures):
-            word_freqs.update(future.result())
+    
+    # For very small files, process directly without parallelization
+    if file_size < 500000:  # Less than 500KB
+        for arg in args:
+            word_freqs.update(tokenize_chunk(*arg))
+    else:
+        with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+            # Submit all tasks at once
+            futures = [executor.submit(tokenize_chunk, *arg) for arg in args]
+            # Process results as they complete
+            for future in as_completed(futures):
+                word_freqs.update(future.result())
+    
     return word_freqs
 
 class PairCounter:
