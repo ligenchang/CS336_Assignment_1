@@ -340,6 +340,19 @@ def multihead_self_attention_with_rope(
     
     return output
 
+class Linear(torch.nn.Module):
+    def __init__(self, in_features, out_features, device=None, dtype=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.W = torch.nn.Parameter(
+            torch.empty(out_features, in_features, device=device, dtype=dtype)
+        )
+        torch.nn.init.trunc_normal_(self.W, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.matmul(x, self.W.t())
+
 def linear(
     d_in: int, 
     d_out: int, 
@@ -358,7 +371,10 @@ def linear(
     Returns:
         torch.Tensor: The output tensor of shape (..., d_out).
     """
-    return torch.matmul(in_features, weights.t())
+    # Use the Linear class for consistency with the test adapter
+    mod = Linear(d_in, d_out)
+    mod.W.data.copy_(weights)
+    return mod(in_features)
 
 def embedding(
     vocab_size: int,
