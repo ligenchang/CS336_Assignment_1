@@ -19,13 +19,26 @@ from .adapters import (
 
 
 def test_linear(numpy_snapshot, ts_state_dict, in_embeddings, d_model, d_ff):
+    print("\n==== TEST LINEAR DEBUG INFO ====")
+    print(f"d_model: {d_model}, d_ff: {d_ff}")
+    print(f"in_embeddings shape: {in_embeddings.shape}, type: {type(in_embeddings)}")
+    
     w1_weight = ts_state_dict[0][f"layers.0.ffn.w1.weight"]
+    print(f"w1_weight shape: {w1_weight.shape}, type: {type(w1_weight)}")
+    print(f"w1_weight first few values: {w1_weight[:2, :5]}")
+    
+    # Run the linear operation
     output = run_linear(
         d_in=d_model,
         d_out=d_ff,
         weights=w1_weight,
         in_features=in_embeddings,
     )
+    
+    print(f"output shape: {output.shape}, type: {type(output)}")
+    print(f"output first few values: {output[:2, :5] if len(output.shape) >= 2 else output[:5]}")
+    print("==== END TEST LINEAR DEBUG INFO ====\n")
+    
     numpy_snapshot.assert_match(
         output
     )
