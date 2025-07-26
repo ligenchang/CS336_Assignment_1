@@ -177,6 +177,23 @@ def rope(
     # Reshape back to original shape
     return torch.stack([y1, y2], dim=-1).view(*shape)
 
+class RMSNorm(torch.nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.eps = eps
+        self.weight = torch.nn.Parameter(
+            torch.ones(d_model, device=device, dtype=dtype)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x = x.float()
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        normed = x / rms
+        out = normed * self.weight
+        return out.to(orig_dtype)  # <-- Add this line
+
 def rmsnorm(
     d_model: int,
     eps: float,
@@ -184,7 +201,7 @@ def rmsnorm(
     in_features: Tensor
 ) -> Tensor:
     """
-    Applies Root Mean Square Layer Normalization.
+    Applies Root Mean Square Layer Normalization using the RMSNorm module.
     
     Args:
         d_model (int): Dimensionality of the input features.
@@ -195,14 +212,10 @@ def rmsnorm(
     Returns:
         Tensor: Normalized tensor of the same shape as in_features.
     """
-    # Calculate the RMS value
-    rms = torch.sqrt(torch.mean(in_features ** 2, dim=-1, keepdim=True) + eps)
-    
-    # Normalize by the RMS
-    normalized = in_features / rms
-    
-    # Scale with learned parameters
-    return normalized * weights
+    # Use the RMSNorm class for consistency with the test adapter
+    norm = RMSNorm(d_model, eps)
+    norm.weight.data.copy_(weights)
+    return norm(in_features)
 
 def multihead_self_attention(
     d_model: int,
@@ -376,6 +389,23 @@ def linear(
     mod.W.data.copy_(weights)
     return mod(in_features)
 
+
+class Embedding(torch.nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weight = torch.nn.Parameter(
+            torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype)
+        )
+        torch.nn.init.trunc_normal_(self.weight, std=0.02)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        # token_ids: (...,)
+        # self.weight: (num_embeddings, embedding_dim)
+        # Output: (..., embedding_dim)
+        return self.weight[token_ids]
+    
 def embedding(
     vocab_size: int,
     d_model: int,
@@ -384,17 +414,20 @@ def embedding(
 ) -> torch.Tensor:
     """
     Embeds token IDs using the provided embedding weights.
-    
+
     Args:
         vocab_size (int): The size of the vocabulary.
         d_model (int): The dimension of the embedding vectors.
         weights (torch.Tensor): The embedding matrix of shape (vocab_size, d_model).
         token_ids (torch.Tensor): The token IDs to embed of shape (...).
-        
+
     Returns:
         torch.Tensor: The embedded tokens of shape (..., d_model).
     """
-    return torch.nn.functional.embedding(token_ids, weights)
+    # Use the custom Embedding class instead of torch.nn.functional.embedding
+    embedding_module = Embedding(vocab_size, d_model)
+    embedding_module.weight.data.copy_(weights)
+    return embedding_module(token_ids)
 
 def swiglu(
     d_model: int,
