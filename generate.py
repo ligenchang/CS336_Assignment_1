@@ -1,4 +1,5 @@
 
+import time
 import torch
 import pickle
 from cs336_basics.nn_utils import transformer_lm
@@ -6,6 +7,7 @@ from cs336_basics.tokenizer import Tokenizer
 import time
 
 # --- Load Tokenizer ---
+import pickle
 with open("tinystories_bpe_vocab.pkl", "rb") as f:
     vocab = pickle.load(f)
 with open("tinystories_bpe_merges.pkl", "rb") as f:
@@ -23,7 +25,8 @@ rope_theta = 10000
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 # --- Load Model Weights ---
-weights = torch.load("tinystories_transformer_ckpt.pt", map_location=device)
+checkpoint = torch.load("tinystories_transformer_ckpt.pt", map_location=device)
+weights = checkpoint["weights"]
 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Loaded model weights.")
 
 # --- Text Generation Function ---
