@@ -17,7 +17,7 @@ num_layers = 4
 num_heads = 16
 rope_theta = 10000
 batch_size = 32
-num_steps = 5000
+num_steps = 50000
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 DATA_PATH = "data/TinyStoriesV2-GPT4-train.txt"

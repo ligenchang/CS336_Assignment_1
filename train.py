@@ -41,7 +41,7 @@ def main():
     num_heads = 16
     rope_theta = 10000
     batch_size = 32
-    num_steps = 5000
+    num_steps = 50000
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     tokens_path = "tinystories_pretok_tokens.pkl"
     checkpoint_path = "tinystories_transformer_ckpt.pt"
@@ -83,9 +83,9 @@ def main():
     weights = init_weights()
 
     # Optimizer
-    base_lr = 7e-4
+    base_lr = 9e-4
     optimizer = AdamW(weights.values(), lr=base_lr, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
-    min_lr = 1e-5
+    min_lr = 2e-5
     warmup_iters = int(0.05 * num_steps)
     cosine_cycle_iters = num_steps - warmup_iters
 
