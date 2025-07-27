@@ -142,14 +142,22 @@ def main():
     weights["lm_head.weight"] = torch.randn(vocab_size, d_model, device=device) * 0.02
     # Optimizer and scheduler
     from cs336_basics.optimizer import AdamW
+    from cs336_basics.lr_scheduler import get_lr_cosine_schedule
     optimizer = AdamW(weights.values(), lr=5e-4, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps)
+    max_lr = 5e-4
+    min_lr = 1e-5
+    warmup_iters = 1000
+    cosine_cycle_iters = num_steps - warmup_iters
 
     # Training loop
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting training...")
     t8 = time.time()
     best_loss = float('inf')
     for step in range(num_steps):
+        # Update learning rate using custom cosine schedule
+        lr = get_lr_cosine_schedule(step, max_lr, min_lr, warmup_iters, cosine_cycle_iters)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
         x, y = get_batch(tokens, batch_size, context_length)
         logits = transformer_lm(
             vocab_size=vocab_size,
@@ -166,7 +174,6 @@ def main():
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        scheduler.step()
 
         if step % 100 == 0:
             if loss.item() < best_loss:
