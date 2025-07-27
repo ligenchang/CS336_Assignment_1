@@ -1,5 +1,7 @@
+
 import torch
 import pickle
+from cs336_basics.nn_utils import transformer_lm
 from cs336_basics.tokenizer import Tokenizer
 import time
 
@@ -17,38 +19,30 @@ d_model = 512
 d_ff = 1344
 num_layers = 4
 num_heads = 16
-
+rope_theta = 10000
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-# --- Model Definition (must match training) ---
-class SimpleTransformerLM(torch.nn.Module):
-    def __init__(self, vocab_size, d_model, d_ff, num_layers, num_heads, context_length):
-        super().__init__()
-        self.embedding = torch.nn.Embedding(vocab_size, d_model)
-        encoder_layer = torch.nn.TransformerEncoderLayer(d_model, num_heads, d_ff, batch_first=True)
-        self.transformer = torch.nn.TransformerEncoder(encoder_layer, num_layers)
-        self.fc_out = torch.nn.Linear(d_model, vocab_size)
-
-    def forward(self, x):
-        x = self.embedding(x)
-        x = self.transformer(x)
-        logits = self.fc_out(x)
-        return logits
-
-# --- Load Model Checkpoint ---
-model = SimpleTransformerLM(vocab_size, d_model, d_ff, num_layers, num_heads, context_length).to(device)
-model.load_state_dict(torch.load("tinystories_transformer_best.pt", map_location=device))
-model.eval()
-print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Loaded model checkpoint.")
+# --- Load Model Weights ---
+weights = torch.load("tinystories_transformer_best.pt", map_location=device)
+print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Loaded model weights.")
 
 # --- Text Generation Function ---
-def sample(model, tokenizer, context, max_tokens=256, temperature=0.7, top_p=0.9):
-    model.eval()
+def sample(transformer_lm, weights, tokenizer, context, max_tokens=256, temperature=0.7, top_p=0.9):
     generated = context[:]
-    input_ids = torch.tensor(generated, dtype=torch.long, device=device).unsqueeze(0)
     for _ in range(max_tokens):
+        input_ids = torch.tensor(generated, dtype=torch.long, device=device).unsqueeze(0)
         with torch.no_grad():
-            logits = model(input_ids)
+            logits = transformer_lm(
+                vocab_size=vocab_size,
+                context_length=input_ids.shape[1],
+                d_model=d_model,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                rope_theta=rope_theta,
+                weights=weights,
+                in_indices=input_ids
+            )
             next_logits = logits[0, -1, :] / temperature
             sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
             cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
@@ -62,13 +56,12 @@ def sample(model, tokenizer, context, max_tokens=256, temperature=0.7, top_p=0.9
         generated.append(next_token)
         if next_token == tokenizer.byte_to_id.get(b'<|endoftext|>'):
             break
-        input_ids = torch.tensor(generated, dtype=torch.long, device=device).unsqueeze(0)
     return generated
 
 # --- Example Usage ---
 prompt = "Once upon a time, there was a little girl named Lily who loved adventures. One day,"
 context = tokenizer.encode(prompt)
-output_ids = sample(model, tokenizer, context, max_tokens=256, temperature=1.0, top_p=0.95)
+output_ids = sample(transformer_lm, weights, tokenizer, context, max_tokens=256, temperature=1.0, top_p=0.95)
 output_text = tokenizer.decode(output_ids)
 print("\n--- Generated Text ---\n")
 print(output_text)

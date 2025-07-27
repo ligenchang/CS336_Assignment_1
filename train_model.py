@@ -1,8 +1,7 @@
 import os
 import pickle
 import torch
-import torch.nn as nn
-import torch.optim as optim
+from cs336_basics.nn_utils import transformer_lm, cross_entropy
 from cs336_basics.tokenizer import Tokenizer
 import multiprocessing
 
@@ -125,36 +124,45 @@ def main():
         return x.to(device), y.to(device)
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Finished preparing batches (elapsed: {time.time()-t7:.2f}s)")
 
-    # Define a simple Transformer model (replace with your implementation)
-    class SimpleTransformerLM(nn.Module):
-        def __init__(self, vocab_size, d_model, d_ff, num_layers, num_heads, context_length):
-            super().__init__()
-            self.embedding = nn.Embedding(vocab_size, d_model)
-            encoder_layer = nn.TransformerEncoderLayer(d_model, num_heads, d_ff, batch_first=True)
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
-            self.fc_out = nn.Linear(d_model, vocab_size)
-
-        def forward(self, x):
-            x = self.embedding(x)
-            x = self.transformer(x)
-            logits = self.fc_out(x)
-            return logits
-
-    model = SimpleTransformerLM(vocab_size, d_model, d_ff, num_layers, num_heads, context_length).to(device)
-
+    # Initialize weights dict for transformer_lm
+    weights = {}
+    weights["token_embeddings.weight"] = torch.randn(vocab_size, d_model, device=device) * 0.02
+    for i in range(num_layers):
+        prefix = f"layers.{i}."
+        weights[prefix + "attn.q_proj.weight"] = torch.randn(d_model, d_model, device=device) * 0.02
+        weights[prefix + "attn.k_proj.weight"] = torch.randn(d_model, d_model, device=device) * 0.02
+        weights[prefix + "attn.v_proj.weight"] = torch.randn(d_model, d_model, device=device) * 0.02
+        weights[prefix + "attn.output_proj.weight"] = torch.randn(d_model, d_model, device=device) * 0.02
+        weights[prefix + "ln1.weight"] = torch.ones(d_model, device=device)
+        weights[prefix + "ln2.weight"] = torch.ones(d_model, device=device)
+        weights[prefix + "ffn.w1.weight"] = torch.randn(d_ff, d_model, device=device) * 0.02
+        weights[prefix + "ffn.w2.weight"] = torch.randn(d_model, d_ff, device=device) * 0.02
+        weights[prefix + "ffn.w3.weight"] = torch.randn(d_ff, d_model, device=device) * 0.02
+    weights["ln_final.weight"] = torch.ones(d_model, device=device)
+    weights["lm_head.weight"] = torch.randn(vocab_size, d_model, device=device) * 0.02
     # Optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=5e-4, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps)
+    from cs336_basics.optimizer import AdamW
+    optimizer = AdamW(weights.values(), lr=5e-4, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_steps)
 
     # Training loop
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting training...")
     t8 = time.time()
     best_loss = float('inf')
     for step in range(num_steps):
-        model.train()
         x, y = get_batch(tokens, batch_size, context_length)
-        logits = model(x)
-        loss = nn.CrossEntropyLoss()(logits.view(-1, vocab_size), y.view(-1))
+        logits = transformer_lm(
+            vocab_size=vocab_size,
+            context_length=context_length,
+            d_model=d_model,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            rope_theta=rope_theta,
+            weights=weights,
+            in_indices=x
+        )
+        loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -163,7 +171,7 @@ def main():
         if step % 100 == 0:
             if loss.item() < best_loss:
                 best_loss = loss.item()
-                torch.save(model.state_dict(), "tinystories_transformer_best.pt")
+                torch.save(weights, "tinystories_transformer_best.pt")
                 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Step {step}: New best loss {best_loss:.4f}, model saved.")
             else:
                 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Step {step}: loss={loss.item():.4f}")
@@ -171,21 +179,26 @@ def main():
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Finished training (elapsed: {time.time()-t8:.2f}s)")
 
     # Save model checkpoint
-    # torch.save(model.state_dict(), "tinystories_transformer.pt")
+    # torch.save(weights, "tinystories_transformer.pt")
 
     # --- Text Generation ---
-    def sample(model, tokenizer, context, max_tokens=256, temperature=1.0, top_p=0.95):
-        model.eval()
+    def sample(transformer_lm, weights, tokenizer, context, max_tokens=256, temperature=1.0, top_p=0.95):
         generated = context[:]
-        input_ids = torch.tensor(generated, dtype=torch.long, device=device).unsqueeze(0)
-        # repetition_penalty = 1.2  # Penalize repeated tokens
         for _ in range(max_tokens):
+            input_ids = torch.tensor(generated, dtype=torch.long, device=device).unsqueeze(0)
             with torch.no_grad():
-                logits = model(input_ids)
+                logits = transformer_lm(
+                    vocab_size=vocab_size,
+                    context_length=input_ids.shape[1],
+                    d_model=d_model,
+                    num_layers=num_layers,
+                    num_heads=num_heads,
+                    d_ff=d_ff,
+                    rope_theta=rope_theta,
+                    weights=weights,
+                    in_indices=input_ids
+                )
                 next_logits = logits[0, -1, :] / temperature
-                # # Apply repetition penalty
-                # for token_id in set(generated):
-                #     next_logits[token_id] /= repetition_penalty
                 sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
                 cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
                 cutoff = cumulative_probs > top_p
@@ -198,7 +211,6 @@ def main():
             generated.append(next_token)
             if next_token == tokenizer.byte_to_id.get(b'<|endoftext|>'):
                 break
-            input_ids = torch.tensor(generated, dtype=torch.long, device=device).unsqueeze(0)
         return generated
 
     # Improved prompt and decoding parameters for fluency
@@ -209,7 +221,7 @@ def main():
         "Excited, Lily packed her backpack and set off on her journey. "
     )
     context = tokenizer.encode(prompt)
-    output_ids = sample(model, tokenizer, context, max_tokens=256, temperature=0.7, top_p=0.9)
+    output_ids = sample(transformer_lm, weights, tokenizer, context, max_tokens=256, temperature=0.7, top_p=0.9)
     output_text = tokenizer.decode(output_ids)
     print("\n--- Generated Text ---\n")
     print(output_text)
