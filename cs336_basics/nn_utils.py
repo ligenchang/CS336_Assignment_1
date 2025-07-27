@@ -214,7 +214,9 @@ def rmsnorm(
     """
     # Use the RMSNorm class for consistency with the test adapter
     norm = RMSNorm(d_model, eps)
+    # Move weights to the same device as in_features
     norm.weight.data.copy_(weights)
+    norm.weight = torch.nn.Parameter(norm.weight.data.to(in_features.device))
     return norm(in_features)
 
 def multihead_self_attention(
@@ -401,9 +403,9 @@ class Embedding(torch.nn.Module):
         torch.nn.init.trunc_normal_(self.weight, std=0.02)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        # token_ids: (...,)
-        # self.weight: (num_embeddings, embedding_dim)
-        # Output: (..., embedding_dim)
+        # Ensure weights are on the same device as token_ids
+        if self.weight.device != token_ids.device:
+            self.weight.data = self.weight.data.to(token_ids.device)
         return self.weight[token_ids]
     
 def embedding(
@@ -424,9 +426,10 @@ def embedding(
     Returns:
         torch.Tensor: The embedded tokens of shape (..., d_model).
     """
-    # Use the custom Embedding class instead of torch.nn.functional.embedding
-    embedding_module = Embedding(vocab_size, d_model)
-    embedding_module.weight.data.copy_(weights)
+    # Use the custom Embedding class, ensure weights and token_ids are on the same device
+    device = token_ids.device
+    embedding_module = Embedding(vocab_size, d_model, device=device)
+    embedding_module.weight.data.copy_(weights.to(device))
     return embedding_module(token_ids)
 
 def swiglu(
