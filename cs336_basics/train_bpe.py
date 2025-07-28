@@ -4,6 +4,8 @@ import regex as re
 from typing import List, Tuple, Dict, Union, BinaryIO, Set, DefaultDict, Counter
 import pathlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+from datetime import datetime
 
 # GPT-2 style pre-tokenizer regex
 GPT2_PATTERN = re.compile(
@@ -58,7 +60,7 @@ def tokenize_chunk(filename: str, start: int, end: int, special_tokens: List[str
     # Use a set for faster token lookup
     special_tokens_set = set(special_tokens)
     
-    print(f"[BPE] Tokenizing chunk from {start} to {end} with special tokens: {special_tokens_set}")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Tokenizing chunk from {start} to {end} with special tokens: {special_tokens_set}")
     # Pre-encode special tokens for reuse
     special_tokens_encoded = {token: (token.encode("utf-8"),) for token in special_tokens_set}
     
@@ -113,13 +115,13 @@ def parallel_pretokenize(filename: str, special_tokens: List[str], num_workers: 
     
     split_token = special_tokens[0].encode("utf-8") if special_tokens else b"\n"
 
-    print(f"[BPE] Using {effective_workers} workers for pre-tokenization.")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Using {effective_workers} workers for pre-tokenization.")
     
     # Read file once to find boundaries
     with open(filename, "rb") as f:
         boundaries = find_chunk_boundaries(f, effective_workers, split_token)
 
-    print(f"[BPE] Found {len(boundaries) - 1} chunk boundaries for parallel pre-tokenization.")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Found {len(boundaries) - 1} chunk boundaries for parallel pre-tokenization.")
     
     # Create arguments for each chunk
     args = [
@@ -127,7 +129,7 @@ def parallel_pretokenize(filename: str, special_tokens: List[str], num_workers: 
         for start, end in zip(boundaries[:-1], boundaries[1:])
     ]
 
-    print("[BPE] Starting parallel pre-tokenization...")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Starting parallel pre-tokenization...")
     
     # Process chunks in parallel
     word_freqs = collections.Counter()
@@ -137,13 +139,13 @@ def parallel_pretokenize(filename: str, special_tokens: List[str], num_workers: 
     # Cap workers to avoid OOM: max 2 for files >2GB, max 4 otherwise
 
     max_workers = effective_workers
-    print(f"[BPE] Using {max_workers} workers for parallel tokenization.")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Using {max_workers} workers for parallel tokenization.")
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(tokenize_chunk, *arg) for arg in args]
         for future in concurrent.futures.as_completed(futures):
             word_freqs.update(future.result())
 
-    print(f"[BPE] Total tokens pre-tokenized: {sum(word_freqs.values())}")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Total tokens pre-tokenized: {sum(word_freqs.values())}")
     
     return word_freqs
 
@@ -346,12 +348,27 @@ def train_bpe(
     merge_iterations = 0
     apply_merge_total_time = 0
     pair_update_total_time = 0
+    get_best_pair_total_time = 0
+    merge_loop_timing = {
+        'get_best_pair': 0.0,
+        'apply_merge': 0.0,
+        'pair_update': 0.0
+    }
 
-    print(f"[BPE] Starting training with vocab size {vocab_size}, initial vocab size {len(vocab)}")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Starting training with vocab size {vocab_size}, initial vocab size {len(vocab)}")
     while len(vocab) < vocab_size:
+        # Time get_best_pair
+        t0 = time.perf_counter()
         best_pair, max_freq = pair_counter.get_best_pair()
+        t1 = time.perf_counter()
+        merge_loop_timing['get_best_pair'] += t1 - t0
+
         if not best_pair or max_freq == 0:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Stopping: no more pairs to merge at iteration {merge_iterations}.")
             break
+
+        if merge_iterations % 100 == 0 or len(vocab) >= vocab_size:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Iter {merge_iterations}: merging pair {best_pair} (freq={max_freq}), vocab size={len(vocab)}")
 
         new_token = best_pair[0] + best_pair[1]
         if new_token in vocab_set:
@@ -363,31 +380,38 @@ def train_bpe(
         merges.append(best_pair)
         next_id += 1
 
+        # Time apply_merge_fast
         merge_start = time.perf_counter()
         word_freqs_dict, total_merged, changed_words = apply_merge_fast(word_freqs, best_pair, protected_words)
-        apply_merge_total_time += time.perf_counter() - merge_start
+        merge_end = time.perf_counter()
+        apply_merge_total_time += merge_end - merge_start
+        merge_loop_timing['apply_merge'] += merge_end - merge_start
 
         if total_merged == 0:
             pair_counter.add_skipped_pair(best_pair)
             continue
 
-        # Update pair counter incrementally with changed words
+        # Time update_pairs
         update_start = time.perf_counter()
-        
         # Convert dict back to Counter if needed for compatibility
         word_freqs = collections.Counter(word_freqs_dict)
-        
         # Get the affected new words (those containing the merged token)
         merged_token = best_pair[0] + best_pair[1]
         affected_new_words = {}
         for word, freq in word_freqs_dict.items():
             if any(tok == merged_token for tok in word):
                 affected_new_words[word] = freq
-
         # Only update pair frequencies for words that changed
         pair_counter.update_pairs(best_pair, changed_words, affected_new_words)
-        pair_update_total_time += time.perf_counter() - update_start
+        update_end = time.perf_counter()
+        pair_update_total_time += update_end - update_start
+        merge_loop_timing['pair_update'] += update_end - update_start
+
         merge_iterations += 1
+        # if merge_iterations % 1000 == 0 or len(vocab) >= vocab_size:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Progress: {merge_iterations} merges, vocab size={len(vocab)}")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Timing (per 1000 merges): get_best_pair={merge_loop_timing['get_best_pair']:.2f}s, apply_merge={merge_loop_timing['apply_merge']:.2f}s, pair_update={merge_loop_timing['pair_update']:.2f}s")
+        merge_loop_timing = {'get_best_pair': 0.0, 'apply_merge': 0.0, 'pair_update': 0.0}
 
     total_time = sum(timings.values()) + apply_merge_total_time + pair_update_total_time
 
@@ -398,6 +422,10 @@ def train_bpe(
     print(f"pair_update (total)      : {pair_update_total_time:.4f} sec")
     print(f"merge iterations         : {merge_iterations}")
     print(f"total                    : {total_time:.4f} sec")
-    print("=========================\n")
+    print("=========================")
+    # Optionally print total time spent in each merge loop step
+    print(f"get_best_pair (total)    : {merge_loop_timing['get_best_pair']:.4f} sec")
+    print(f"apply_merge (total)      : {merge_loop_timing['apply_merge']:.4f} sec")
+    print(f"pair_update (total)      : {merge_loop_timing['pair_update']:.4f} sec\n")
 
     return vocab, merges
