@@ -63,7 +63,6 @@ def sample(transformer_lm, weights, tokenizer, context, max_tokens=256, temperat
 
 # --- Example Usage ---
 prompt = "Once upon a time, there was a little girl named Lily who loved adventures. One day,"
-prompt = "Tom is angry because he lost his favorite toy. He searched everywhere but couldn't find it. Feeling sad, he decided to go to the park to clear his mind."
 
 context = tokenizer.encode(prompt)
 output_ids = sample(transformer_lm, weights, tokenizer, context, max_tokens=256, temperature=0.7, top_p=0.9)

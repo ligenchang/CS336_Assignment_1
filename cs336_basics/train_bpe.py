@@ -58,27 +58,52 @@ def tokenize_chunk(filename: str, start: int, end: int, special_tokens: List[str
     # Use a set for faster token lookup
     special_tokens_set = set(special_tokens)
     
+    print(f"[BPE] Tokenizing chunk from {start} to {end} with special tokens: {special_tokens_set}")
     # Pre-encode special tokens for reuse
     special_tokens_encoded = {token: (token.encode("utf-8"),) for token in special_tokens_set}
     
-    with open(filename, "rb") as f:
-        f.seek(start)
-        chunk = f.read(end - start).decode("utf-8", errors="ignore")
-        tokens = pre_tokenize_text_with_special(chunk, special_tokens)
-    
-    # Preallocate a larger initial Counter to reduce resizing
+    import mmap
+    buffer_size = 64 * 1024 * 1024  # 64MB sub-buffers
     word_freqs = collections.Counter()
-    
-    # Process tokens in larger batches
-    for token in tokens:
-        if token in special_tokens_set:
-            # Use pre-encoded tuple for special tokens
-            word_freqs[special_tokens_encoded[token]] += 1
-        else:
-            # More efficient way to convert to bytes
-            token_bytes = token.encode("utf-8")
-            word_freqs[tuple(bytes([b]) for b in token_bytes)] += 1
-            
+    with open(filename, "rb") as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        file_size = mm.size()
+        chunk_end = min(end, file_size)
+        pos = start
+        leftover = ""
+        while pos < chunk_end:
+            read_end = min(pos + buffer_size, chunk_end)
+            chunk_bytes = mm[pos:read_end]
+            # Decode with possible leftover from previous buffer
+            chunk = leftover + chunk_bytes.decode("utf-8", errors="ignore")
+            # Try not to split multi-byte utf-8 chars: if not at end, may need to trim
+            if read_end < chunk_end:
+                # Find last complete character
+                for i in range(1, 5):
+                    try:
+                        chunk_bytes[-i:].decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    i = 0
+                if i > 0:
+                    # Save incomplete bytes for next buffer
+                    leftover = chunk[-i:]
+                    chunk = chunk[:-i]
+                else:
+                    leftover = ""
+            else:
+                leftover = ""
+            tokens = pre_tokenize_text_with_special(chunk, special_tokens)
+            for token in tokens:
+                if token in special_tokens_set:
+                    word_freqs[special_tokens_encoded[token]] += 1
+                else:
+                    token_bytes = token.encode("utf-8")
+                    word_freqs[tuple(bytes([b]) for b in token_bytes)] += 1
+            pos = read_end
+        mm.close()
     return word_freqs
 
 def parallel_pretokenize(filename: str, special_tokens: List[str], num_workers: int) -> collections.Counter:
@@ -87,33 +112,38 @@ def parallel_pretokenize(filename: str, special_tokens: List[str], num_workers: 
     effective_workers = min(num_workers, max(1, file_size // (1024 * 1024)))  # 1 worker per MB, at least 1
     
     split_token = special_tokens[0].encode("utf-8") if special_tokens else b"\n"
+
+    print(f"[BPE] Using {effective_workers} workers for pre-tokenization.")
     
     # Read file once to find boundaries
     with open(filename, "rb") as f:
         boundaries = find_chunk_boundaries(f, effective_workers, split_token)
+
+    print(f"[BPE] Found {len(boundaries) - 1} chunk boundaries for parallel pre-tokenization.")
     
     # Create arguments for each chunk
     args = [
         (filename, start, end, special_tokens)
         for start, end in zip(boundaries[:-1], boundaries[1:])
     ]
+
+    print("[BPE] Starting parallel pre-tokenization...")
     
     # Process chunks in parallel
     word_freqs = collections.Counter()
-    for arg in args:
-        word_freqs.update(tokenize_chunk(*arg))
-    
-    # # For very small files, process directly without parallelization
-    # if file_size < 500000:  # Less than 500KB
-    #     for arg in args:
-    #         word_freqs.update(tokenize_chunk(*arg))
-    # else:
-    #     with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-    #         # Submit all tasks at once
-    #         futures = [executor.submit(tokenize_chunk, *arg) for arg in args]
-    #         # Process results as they complete
-    #         for future in as_completed(futures):
-    #             word_freqs.update(future.result())
+    # for arg in args:
+    #     word_freqs.update(tokenize_chunk(*arg))
+    import concurrent
+    # Cap workers to avoid OOM: max 2 for files >2GB, max 4 otherwise
+
+    max_workers = effective_workers
+    print(f"[BPE] Using {max_workers} workers for parallel tokenization.")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(tokenize_chunk, *arg) for arg in args]
+        for future in concurrent.futures.as_completed(futures):
+            word_freqs.update(future.result())
+
+    print(f"[BPE] Total tokens pre-tokenized: {sum(word_freqs.values())}")
     
     return word_freqs
 
@@ -317,6 +347,7 @@ def train_bpe(
     apply_merge_total_time = 0
     pair_update_total_time = 0
 
+    print(f"[BPE] Starting training with vocab size {vocab_size}, initial vocab size {len(vocab)}")
     while len(vocab) < vocab_size:
         best_pair, max_freq = pair_counter.get_best_pair()
         if not best_pair or max_freq == 0:

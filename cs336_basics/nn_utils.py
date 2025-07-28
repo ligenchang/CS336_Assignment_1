@@ -586,6 +586,7 @@ def transformer_lm(
         weights=weights["token_embeddings.weight"],
         token_ids=in_indices
     )
+
     
     # Process through transformer layers
     x = token_embeddings
