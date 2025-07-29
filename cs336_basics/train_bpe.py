@@ -197,9 +197,9 @@ class PairCounter:
 
 def apply_merge_fast(word_freqs: Dict[Tuple[int, ...], int], best_pair: Tuple[int, int], merged_token_id: int, affected_words=None):
     bp0, bp1 = best_pair
-    new_word_freqs = {}
     merged_count = 0
     changed_words = {}
+    new_words = {}
 
     # Only process affected words if provided, else all words
     if affected_words is None:
@@ -223,17 +223,11 @@ def apply_merge_fast(word_freqs: Dict[Tuple[int, ...], int], best_pair: Tuple[in
         if merged:
             changed_words[word] = freq
             new_word_tuple = tuple(new_word)
-            new_word_freqs[new_word_tuple] = new_word_freqs.get(new_word_tuple, 0) + freq
+            new_words[new_word_tuple] = new_words.get(new_word_tuple, 0) + freq
         else:
-            new_word_freqs[word] = freq
+            new_words[word] = freq
 
-    # For all other words not affected, just copy their counts
-    if affected_words is not None:
-        unaffected_words = set(word_freqs.keys()) - set(affected_words)
-        for word in unaffected_words:
-            new_word_freqs[word] = word_freqs[word]
-
-    return new_word_freqs, merged_count, changed_words
+    return new_words, merged_count, changed_words, set(affected_words)
 
 def train_bpe(
     input_path: Union[str, pathlib.Path],
@@ -287,8 +281,11 @@ def train_bpe(
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Starting BPE merge loop (target vocab size: {vocab_size})...")
     t0 = time.time()
     update_pairs_total_time = 0.0
+    get_best_pair_total_time = 0.0
     while len(token_to_id) < vocab_size:
+        t_get_best = time.time()
         best_pair, max_freq = pair_counter.get_best_pair()
+        get_best_pair_total_time += time.time() - t_get_best
 
         if not best_pair or max_freq == 0:
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] No more pairs to merge at iteration {merge_iterations}.")
@@ -311,17 +308,19 @@ def train_bpe(
 
         # Only process affected words for this merge
         affected_words = pair_counter.pair_to_words.get(best_pair, None)
-        word_freqs_dict, total_merged, changed_words = apply_merge_fast(
+        t_apply_merge = time.time()
+        word_freqs_dict, total_merged, changed_words, affected_words_set = apply_merge_fast(
             word_freqs, best_pair, merged_token_id, affected_words
         )
+        apply_merge_total_time = apply_merge_total_time + (time.time() - t_apply_merge) if 'apply_merge_total_time' in locals() else (time.time() - t_apply_merge)
 
         if total_merged == 0:
             pair_counter.add_skipped_pair(best_pair)
             continue
 
-        # Update pairs
-        # word_freqs = collections.Counter(word_freqs_dict)
-        word_freqs.clear()
+        # In-place update: remove affected words, add new/changed words
+        for word in affected_words_set:
+            word_freqs.pop(word, None)
         word_freqs.update(word_freqs_dict)
 
         # Filter new words containing the merged token ID
@@ -334,6 +333,8 @@ def train_bpe(
         merge_iterations += 1
     timings['bpe_merge_loop'] = time.time() - t0
     timings['update_pairs_total'] = update_pairs_total_time
+    timings['get_best_pair_total'] = get_best_pair_total_time
+    timings['apply_merge_total'] = apply_merge_total_time if 'apply_merge_total_time' in locals() else 0.0
 
     print("\n===== Timing Report =====")
     for k, v in timings.items():
