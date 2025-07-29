@@ -279,6 +279,7 @@ def train_bpe(
 
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Starting BPE merge loop (target vocab size: {vocab_size})...")
     t0 = time.time()
+    update_pairs_total_time = 0.0
     while len(token_to_id) < vocab_size:
         best_pair, max_freq = pair_counter.get_best_pair()
 
@@ -314,10 +315,13 @@ def train_bpe(
         # Filter new words containing the merged token ID
         affected_new_words = {w: f for w, f in word_freqs_dict.items() if merged_token_id in w}
 
+        t_update = time.time()
         pair_counter.update_pairs(best_pair, changed_words, affected_new_words)
+        update_pairs_total_time += time.time() - t_update
 
         merge_iterations += 1
     timings['bpe_merge_loop'] = time.time() - t0
+    timings['update_pairs_total'] = update_pairs_total_time
 
     print("\n===== Timing Report =====")
     for k, v in timings.items():
