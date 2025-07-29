@@ -133,6 +133,7 @@ def parallel_pretokenize(filename: str, special_tokens: List[str], num_workers: 
 class PairCounter:
     def __init__(self, word_freqs: collections.Counter, skipped_pairs: Set[Tuple[int, int]] = None, id_to_token: Dict[int, bytes] = None):
         self.pair_freqs = collections.defaultdict(int)
+        self.pair_to_words = collections.defaultdict(set)
         self.skipped_pairs = skipped_pairs or set()
         self.id_to_token = id_to_token
 
@@ -143,12 +144,11 @@ class PairCounter:
                 pair = (word[i], word[i + 1])
                 if pair not in self.skipped_pairs:
                     self.pair_freqs[pair] += freq
-    
-    def update_pairs(self, best_pair: Tuple[int, int], old_words: Dict[Tuple[int, ...], int], new_words: Dict[Tuple[int, ...], int]) -> None:
-        bp0, bp1 = best_pair
-        merged = bp0 * 256 + bp1  # This is just an example; actually, we represent merged tokens as tuple or int IDs elsewhere
+                    self.pair_to_words[pair].add(word)
 
-        # Decrement old pairs
+    
+    def update_pairs(self, old_words: Dict[Tuple[int, ...], int], new_words: Dict[Tuple[int, ...], int]) -> None:
+        # Remove changed words from all pairs they used to be in (before merge)
         for word, freq in old_words.items():
             if len(word) <= 1:
                 continue
@@ -158,7 +158,12 @@ class PairCounter:
                     self.pair_freqs[pair] -= freq
                     if self.pair_freqs[pair] <= 0:
                         del self.pair_freqs[pair]
-        # Increment new pairs
+                # Remove word from pair_to_words
+                if word in self.pair_to_words.get(pair, set()):
+                    self.pair_to_words[pair].discard(word)
+                    if not self.pair_to_words[pair]:
+                        del self.pair_to_words[pair]
+        # Add new words to all pairs they are now in (after merge)
         for word, freq in new_words.items():
             if len(word) <= 1:
                 continue
@@ -166,6 +171,7 @@ class PairCounter:
                 pair = (word[i], word[i + 1])
                 if pair not in self.skipped_pairs:
                     self.pair_freqs[pair] += freq
+                    self.pair_to_words[pair].add(word)
     
     def get_best_pair(self) -> Tuple[Tuple[int, int], int]:
         if not self.pair_freqs:
@@ -184,42 +190,43 @@ class PairCounter:
         if pair in self.pair_freqs:
             del self.pair_freqs[pair]
 
-def apply_merge_fast(word_freqs: Dict[Tuple[int, ...], int], best_pair: Tuple[int, int], protected_words: Set[Tuple[int, ...]], merged_token_id: int):
+def apply_merge_fast(word_freqs: Dict[Tuple[int, ...], int], best_pair: Tuple[int, int], merged_token_id: int, affected_words=None):
     bp0, bp1 = best_pair
     new_word_freqs = {}
     merged_count = 0
     changed_words = {}
 
-    for word, freq in word_freqs.items():
-        if word in protected_words:
-            new_word_freqs[word] = freq
-            continue
+    # Only process affected words if provided, else all words
+    if affected_words is None:
+        affected_words = word_freqs.keys()
 
-        contains_pair = False
-        for i in range(len(word) - 1):
-            if word[i] == bp0 and word[i + 1] == bp1:
-                contains_pair = True
-                break
-
-        if not contains_pair:
-            new_word_freqs[word] = freq
-            continue
-
-        changed_words[word] = freq
-
+    for word in affected_words:
+        freq = word_freqs[word]
+        # Merge all occurrences of the pair in the word
         new_word = []
         i = 0
+        merged = False
         while i < len(word):
             if i < len(word) - 1 and word[i] == bp0 and word[i + 1] == bp1:
                 new_word.append(merged_token_id)
                 i += 2
+                merged = True
                 merged_count += 1
             else:
                 new_word.append(word[i])
                 i += 1
+        if merged:
+            changed_words[word] = freq
+            new_word_tuple = tuple(new_word)
+            new_word_freqs[new_word_tuple] = new_word_freqs.get(new_word_tuple, 0) + freq
+        else:
+            new_word_freqs[word] = freq
 
-        new_word_tuple = tuple(new_word)
-        new_word_freqs[new_word_tuple] = new_word_freqs.get(new_word_tuple, 0) + freq
+    # For all other words not affected, just copy their counts
+    if affected_words is not None:
+        unaffected_words = set(word_freqs.keys()) - set(affected_words)
+        for word in unaffected_words:
+            new_word_freqs[word] = word_freqs[word]
 
     return new_word_freqs, merged_count, changed_words
 
@@ -255,13 +262,8 @@ def train_bpe(
 
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Protecting special tokens...")
     t0 = time.time()
-    special_token_ids = set(token_to_id[st.encode("utf-8")] for st in special_tokens)
-    protected_words = set()
-    for word in word_freqs:
-        if any(tok in special_token_ids for tok in word):
-            protected_words.add(word)
+
     timings['special_token_protection'] = time.time() - t0
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Special token protection complete. {len(protected_words)} protected words. ({timings['special_token_protection']:.2f} sec)")
 
     skipped_pairs = set()
     merges: List[Tuple[bytes, bytes]] = []
@@ -302,21 +304,26 @@ def train_bpe(
         merged_token_id = next_id
         next_id += 1
 
-        # Apply merge fast: replace pairs in word_freqs with merged token ID
-        word_freqs_dict, total_merged, changed_words = apply_merge_fast(word_freqs, best_pair, protected_words, merged_token_id)
+        # Only process affected words for this merge
+        affected_words = pair_counter.pair_to_words.get(best_pair, None)
+        word_freqs_dict, total_merged, changed_words = apply_merge_fast(
+            word_freqs, best_pair, merged_token_id, affected_words
+        )
 
         if total_merged == 0:
             pair_counter.add_skipped_pair(best_pair)
             continue
 
         # Update pairs
-        word_freqs = collections.Counter(word_freqs_dict)
+        # word_freqs = collections.Counter(word_freqs_dict)
+        word_freqs.clear()
+        word_freqs.update(word_freqs_dict)
 
         # Filter new words containing the merged token ID
         affected_new_words = {w: f for w, f in word_freqs_dict.items() if merged_token_id in w}
 
         t_update = time.time()
-        pair_counter.update_pairs(best_pair, changed_words, affected_new_words)
+        pair_counter.update_pairs(changed_words, affected_new_words)
         update_pairs_total_time += time.time() - t_update
 
         merge_iterations += 1
