@@ -123,10 +123,15 @@ def parallel_pretokenize(filename: str, special_tokens: List[str], num_workers: 
     word_freqs = collections.Counter()
     import concurrent.futures
     max_workers = effective_workers
+    print(f"[parallel_pretokenize] Tokenizing {len(args)} chunks with {max_workers} workers...")
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(tokenize_chunk, *arg) for arg in args]
+        completed = 0
+        total = len(futures)
         for future in concurrent.futures.as_completed(futures):
             word_freqs.update(future.result())
+            completed += 1
+            print(f"[parallel_pretokenize] Completed {completed}/{total} chunks.")
 
     return word_freqs
 
