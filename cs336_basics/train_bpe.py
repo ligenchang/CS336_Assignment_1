@@ -245,41 +245,42 @@ def train_bpe(
             id_to_token[next_id] = b_st
             next_id += 1
 
-    start = time.perf_counter()
-    # Pre-tokenize and get frequencies as int-token tuples
-    word_freqs = parallel_pretokenize(input_path, special_tokens, num_workers, token_to_id)
-    timings["pretokenize"] = time.perf_counter() - start
 
-    # Protect words containing special tokens (by ID tuple)
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Starting pre-tokenization...")
+    t0 = time.time()
+    word_freqs = parallel_pretokenize(input_path, special_tokens, num_workers, token_to_id)
+    timings['pretokenization'] = time.time() - t0
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Pre-tokenization complete. {sum(word_freqs.values())} words. ({timings['pretokenization']:.2f} sec)")
+
+
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Protecting special tokens...")
+    t0 = time.time()
     special_token_ids = set(token_to_id[st.encode("utf-8")] for st in special_tokens)
     protected_words = set()
     for word in word_freqs:
         if any(tok in special_token_ids for tok in word):
             protected_words.add(word)
-    timings["protect_special"] = time.perf_counter() - start
+    timings['special_token_protection'] = time.time() - t0
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Special token protection complete. {len(protected_words)} protected words. ({timings['special_token_protection']:.2f} sec)")
 
     skipped_pairs = set()
     merges: List[Tuple[bytes, bytes]] = []
 
-    start = time.perf_counter()
+
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Initializing pair counter...")
+    t0 = time.time()
     pair_counter = PairCounter(word_freqs, skipped_pairs, id_to_token)
-    timings["init_pair_counter"] = time.perf_counter() - start
+    timings['pair_counter_init'] = time.time() - t0
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Pair counter initialized. ({timings['pair_counter_init']:.2f} sec)")
 
     merge_iterations = 0
-    apply_merge_total_time = 0
-    pair_update_total_time = 0
-    merge_loop_timing = {
-        'get_best_pair': 0.0,
-        'apply_merge': 0.0,
-        'pair_update': 0.0
-    }
+    # timing variables removed
 
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Starting training with vocab size {vocab_size}, initial vocab size {len(token_to_id)}")
+
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] Starting BPE merge loop (target vocab size: {vocab_size})...")
+    t0 = time.time()
     while len(token_to_id) < vocab_size:
-        t0 = time.perf_counter()
         best_pair, max_freq = pair_counter.get_best_pair()
-        t1 = time.perf_counter()
-        merge_loop_timing['get_best_pair'] += t1 - t0
 
         if not best_pair or max_freq == 0:
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [BPE] No more pairs to merge at iteration {merge_iterations}.")
@@ -301,43 +302,27 @@ def train_bpe(
         next_id += 1
 
         # Apply merge fast: replace pairs in word_freqs with merged token ID
-        merge_start = time.perf_counter()
-        # Note: apply_merge_fast expects token IDs, merged token is new ID (int)
         word_freqs_dict, total_merged, changed_words = apply_merge_fast(word_freqs, best_pair, protected_words, merged_token_id)
-        merge_end = time.perf_counter()
-        apply_merge_total_time += merge_end - merge_start
-        merge_loop_timing['apply_merge'] += merge_end - merge_start
 
         if total_merged == 0:
             pair_counter.add_skipped_pair(best_pair)
             continue
 
         # Update pairs
-        update_start = time.perf_counter()
         word_freqs = collections.Counter(word_freqs_dict)
 
         # Filter new words containing the merged token ID
         affected_new_words = {w: f for w, f in word_freqs_dict.items() if merged_token_id in w}
 
         pair_counter.update_pairs(best_pair, changed_words, affected_new_words)
-        update_end = time.perf_counter()
-        pair_update_total_time += update_end - update_start
-        merge_loop_timing['pair_update'] += update_end - update_start
 
         merge_iterations += 1
-
-    total_time = sum(timings.values()) + apply_merge_total_time + pair_update_total_time
+    timings['bpe_merge_loop'] = time.time() - t0
 
     print("\n===== Timing Report =====")
     for k, v in timings.items():
-        print(f"{k:25s}: {v:.4f} sec")
-    print(f"apply_merge (total)      : {apply_merge_total_time:.4f} sec")
-    print(f"pair_update (total)      : {pair_update_total_time:.4f} sec")
-    print(f"merge iterations         : {merge_iterations}")
-    print(f"total                    : {total_time:.4f} sec")
+        print(f"{k:30s}: {v:.4f} sec")
+    print(f"merge iterations{' ':14s}: {merge_iterations}")
     print("=========================")
-    print(f"get_best_pair (total)    : {merge_loop_timing['get_best_pair']:.4f} sec")
-    print(f"apply_merge (total)      : {merge_loop_timing['apply_merge']:.4f} sec")
-    print(f"pair_update (total)      : {merge_loop_timing['pair_update']:.4f} sec\n")
 
     return id_to_token, merges
