@@ -58,8 +58,8 @@ def test_train_bpe():
         }
     # Rather than checking that the vocabs exactly match (since they could
     # have been constructed differently, we'll make sure that the vocab keys and values match)
-    print("vocab", vocab)
-    print("reference_vocab", reference_vocab)
+    # print("vocab", vocab)
+    # print("reference_vocab", reference_vocab)
     assert set(vocab.keys()) == set(reference_vocab.keys())
     assert set(vocab.values()) == set(reference_vocab.values())
 
@@ -78,7 +78,7 @@ def test_train_bpe_special_tokens(snapshot):
 
     # Check that the special token is not in the vocab
     vocabs_without_specials = [word for word in vocab.values() if word != b"<|endoftext|>"]
-    print("vocabs_without_specials:", vocabs_without_specials)
+    # print("vocabs_without_specials:", vocabs_without_specials)
     for word_bytes in vocabs_without_specials:
         assert b"<|" not in word_bytes
 
