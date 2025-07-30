@@ -10,16 +10,16 @@ class Tokenizer:
     @classmethod
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: Optional[list[str]] = None):
         """
-        Construct a Tokenizer from pickled vocab and merges files, and optional special tokens.
-        vocab_filepath: path to vocab file (expects pickle: {id: bytes})
-        merges_filepath: path to merges file (expects pickle: list of (bytes, bytes))
+        Construct a Tokenizer from serialized vocab and merges files, and optional special tokens.
+        vocab_filepath: path to vocab file (expects pickle: {id: token as bytes})
+        merges_filepath: path to merges file (expects pickle: list of (bytes, bytes) pairs)
         special_tokens: list of special tokens (str)
         """
         import pickle
-        # Load vocab
+        # Load vocab from pickle
         with open(vocab_filepath, 'rb') as vf:
             vocab = pickle.load(vf)
-        # Load merges
+        # Load merges from pickle
         with open(merges_filepath, 'rb') as mf:
             merges = pickle.load(mf)
 
