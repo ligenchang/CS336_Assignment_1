@@ -7,6 +7,32 @@ import collections
 import itertools
 
 class Tokenizer:
+    @classmethod
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: Optional[list[str]] = None):
+        """
+        Construct a Tokenizer from pickled vocab and merges files, and optional special tokens.
+        vocab_filepath: path to vocab file (expects pickle: {id: bytes})
+        merges_filepath: path to merges file (expects pickle: list of (bytes, bytes))
+        special_tokens: list of special tokens (str)
+        """
+        import pickle
+        # Load vocab
+        with open(vocab_filepath, 'rb') as vf:
+            vocab = pickle.load(vf)
+        # Load merges
+        with open(merges_filepath, 'rb') as mf:
+            merges = pickle.load(mf)
+
+        # Add special tokens to vocab if not present
+        if special_tokens:
+            max_id = max(vocab.keys(), default=-1)
+            for token in special_tokens:
+                token_bytes = token.encode('utf-8')
+                if token_bytes not in vocab.values():
+                    max_id += 1
+                    vocab[max_id] = token_bytes
+
+        return cls(vocab, merges, special_tokens)
     """
     A byte-level BPE tokenizer.
     """
@@ -156,67 +182,70 @@ class Tokenizer:
                     
         return tokens
 
+
     def _bpe_encode(self, byte_encoded: bytes) -> List[int]:
         """
         Encode a byte string using BPE.
-        
+
         Args:
             byte_encoded: The UTF-8 encoded bytes
-            
+
         Returns:
             A list of token ids
         """
         if not byte_encoded:
             return []
-        
-        # Split the bytes into individual bytes (initial tokens)
+
         tokens = [bytes([b]) for b in byte_encoded]
-        
-        # Apply merges iteratively
+        merge_ranks = self.merge_ranks
+        byte_to_id = self.byte_to_id
+
         while len(tokens) > 1:
-            # Get adjacent pairs and their ranks in one pass for efficiency
-            pairs_with_ranks = {}
+            best_pair = None
+            best_rank = float('inf')
+
+            # Identify best mergeable pair in a single pass
             for i in range(len(tokens) - 1):
                 pair = (tokens[i], tokens[i + 1])
-                if pair in self.merge_ranks and (pair[0] + pair[1]) in self.byte_to_id:
-                    pairs_with_ranks[pair] = self.merge_ranks[pair]
-            
-            if not pairs_with_ranks:
-                break  # No valid merges left
-            
-            # Find the best pair (with lowest rank)
-            best_pair = min(pairs_with_ranks.items(), key=lambda x: x[1])[0]
-            
-            # Apply the merge
-            first, second = best_pair
-            merged = first + second
-            
-            # Fast merge implementation
+                if pair in merge_ranks:
+                    rank = merge_ranks[pair]
+                    merged = pair[0] + pair[1]
+                    if merged in byte_to_id and rank < best_rank:
+                        best_rank = rank
+                        best_pair = pair
+
+            if best_pair is None:
+                break
+
+            # Merge all instances of the best pair
             result = []
             i = 0
+            first, second = best_pair
             while i < len(tokens):
-                if i < len(tokens) - 1 and tokens[i] == first and tokens[i+1] == second:
-                    result.append(merged)
+                if i < len(tokens) - 1 and tokens[i] == first and tokens[i + 1] == second:
+                    result.append(first + second)
                     i += 2
                 else:
                     result.append(tokens[i])
                     i += 1
 
-            
             tokens = result
+
+        return [byte_to_id[tok] for tok in tokens if tok in byte_to_id]
+
         
         # Convert tokens to ids efficiently
         result = []
         for token in tokens:
             # Most common case: token is directly in the vocabulary
-            if token in self.byte_to_id:
-                result.append(self.byte_to_id[token])
+            if token in byte_to_id:
+                result.append(byte_to_id[token])
             else:
                 # If a token isn't in our vocabulary, split it into individual bytes
                 for b in token:
                     byte_token = bytes([b])
-                    if byte_token in self.byte_to_id:
-                        result.append(self.byte_to_id[byte_token])
+                    if byte_token in byte_to_id:
+                        result.append(byte_to_id[byte_token])
         
         return result
 
