@@ -5,6 +5,7 @@ import regex as re
 from typing import Dict, List, Tuple, Set, Iterator, Union, Optional, Any
 import collections
 import itertools
+import heapq
 
 class Tokenizer:
     @classmethod
@@ -183,71 +184,210 @@ class Tokenizer:
         return tokens
 
 
+    # def _bpe_encode(self, byte_encoded: bytes) -> List[int]:
+    #     """
+    #     Encode a byte string using BPE.
+
+    #     Args:
+    #         byte_encoded: The UTF-8 encoded bytes
+
+    #     Returns:
+    #         A list of token ids
+    #     """
+    #     if not byte_encoded:
+    #         return []
+
+    #     tokens = [bytes([b]) for b in byte_encoded]
+    #     merge_ranks = self.merge_ranks
+    #     byte_to_id = self.byte_to_id
+
+    #     while len(tokens) > 1:
+    #         best_pair = None
+    #         best_rank = float('inf')
+
+    #         # Identify best mergeable pair in a single pass
+    #         for i in range(len(tokens) - 1):
+    #             pair = (tokens[i], tokens[i + 1])
+    #             if pair in merge_ranks:
+    #                 rank = merge_ranks[pair]
+    #                 merged = pair[0] + pair[1]
+    #                 if merged in byte_to_id and rank < best_rank:
+    #                     best_rank = rank
+    #                     best_pair = pair
+
+    #         if best_pair is None:
+    #             break
+
+    #         # Merge all instances of the best pair
+    #         result = []
+    #         i = 0
+    #         first, second = best_pair
+    #         while i < len(tokens):
+    #             if i < len(tokens) - 1 and tokens[i] == first and tokens[i + 1] == second:
+    #                 result.append(first + second)
+    #                 i += 2
+    #             else:
+    #                 result.append(tokens[i])
+    #                 i += 1
+
+    #         tokens = result
+
+    #     return [byte_to_id[tok] for tok in tokens if tok in byte_to_id]
+
+
     def _bpe_encode(self, byte_encoded: bytes) -> List[int]:
-        """
-        Encode a byte string using BPE.
-
-        Args:
-            byte_encoded: The UTF-8 encoded bytes
-
-        Returns:
-            A list of token ids
-        """
         if not byte_encoded:
             return []
 
         tokens = [bytes([b]) for b in byte_encoded]
-        merge_ranks = self.merge_ranks
-        byte_to_id = self.byte_to_id
+        n = len(tokens)
 
-        while len(tokens) > 1:
-            best_pair = None
-            best_rank = float('inf')
+        prev = list(range(-1, n - 1))
+        next = list(range(1, n + 1))
+        next[-1] = -1
 
-            # Identify best mergeable pair in a single pass
-            for i in range(len(tokens) - 1):
-                pair = (tokens[i], tokens[i + 1])
-                if pair in merge_ranks:
-                    rank = merge_ranks[pair]
-                    merged = pair[0] + pair[1]
-                    if merged in byte_to_id and rank < best_rank:
-                        best_rank = rank
-                        best_pair = pair
+        alive = [True] * n
 
-            if best_pair is None:
-                break
+        pair_positions = {}
+        heap = []
 
-            # Merge all instances of the best pair
-            result = []
-            i = 0
-            first, second = best_pair
-            while i < len(tokens):
-                if i < len(tokens) - 1 and tokens[i] == first and tokens[i + 1] == second:
-                    result.append(first + second)
-                    i += 2
-                else:
-                    result.append(tokens[i])
-                    i += 1
+        def add_pair(pos: int):
+            if pos == -1 or pos == n - 1:
+                return
+            if not (alive[pos] and alive[next[pos]]):
+                return
+            pair = (tokens[pos], tokens[next[pos]])
+            if pair in self.merge_ranks:
+                rank = self.merge_ranks[pair]
+                heapq.heappush(heap, (rank, pos))
+                pair_positions.setdefault(pair, set()).add(pos)
 
-            tokens = result
+        for i in range(n - 1):
+            add_pair(i)
 
-        return [byte_to_id[tok] for tok in tokens if tok in byte_to_id]
+        while heap:
+            rank, pos = heapq.heappop(heap)
 
-        
-        # Convert tokens to ids efficiently
-        result = []
-        for token in tokens:
-            # Most common case: token is directly in the vocabulary
-            if token in byte_to_id:
-                result.append(byte_to_id[token])
+            if pos == -1 or pos == n - 1:
+                continue
+            if not alive[pos] or not alive[next[pos]]:
+                continue
+            pair = (tokens[pos], tokens[next[pos]])
+            if pair not in self.merge_ranks or self.merge_ranks[pair] != rank:
+                continue
+
+            positions_to_merge = []
+            if pair in pair_positions:
+                candidates = list(pair_positions[pair])
             else:
-                # If a token isn't in our vocabulary, split it into individual bytes
-                for b in token:
-                    byte_token = bytes([b])
-                    if byte_token in byte_to_id:
-                        result.append(byte_to_id[byte_token])
-        
-        return result
+                candidates = []
+
+            for p in candidates:
+                if p != -1 and p < n - 1 and alive[p] and alive[next[p]]:
+                    current_pair = (tokens[p], tokens[next[p]])
+                    if current_pair == pair:
+                        positions_to_merge.append(p)
+
+            if not positions_to_merge:
+                continue
+
+            positions_to_merge.sort()
+            pair_positions[pair].difference_update(positions_to_merge)
+
+            for left_pos in positions_to_merge:
+                right_pos = next[left_pos]
+                if not (alive[left_pos] and alive[right_pos]):
+                    continue
+
+                merged_token = tokens[left_pos] + tokens[right_pos]
+                if merged_token not in self.byte_to_id:
+                    continue
+
+                tokens[left_pos] = merged_token
+                alive[right_pos] = False
+
+                nxt = next[right_pos]
+                next[left_pos] = nxt
+                if nxt != -1:
+                    prev[nxt] = left_pos
+
+                def remove_pair(pos_to_remove):
+                    if pos_to_remove == -1 or pos_to_remove >= n - 1:
+                        return
+                    if not (alive[pos_to_remove] and alive[next[pos_to_remove]]):
+                        return
+                    p = (tokens[pos_to_remove], tokens[next[pos_to_remove]])
+                    if p in pair_positions:
+                        pair_positions[p].discard(pos_to_remove)
+
+                remove_pair(prev[left_pos])
+                remove_pair(left_pos)
+                remove_pair(right_pos)
+
+                add_pair(prev[left_pos])
+                add_pair(left_pos)
+
+        result = []
+        i = 0
+        while i != -1 and i < n:
+            if alive[i]:
+                result.append(tokens[i])
+            i = next[i]
+
+        return [self.byte_to_id[tok] for tok in result if tok in self.byte_to_id]
+
+
+
+
+    
+
+    # def _bpe_encode(self, byte_encoded: bytes) -> list[int]:
+    #     if not byte_encoded:
+    #         return []
+
+    #     tokens = [bytes([b]) for b in byte_encoded]
+    #     merge_ranks = self.merge_ranks
+    #     byte_to_id = self.byte_to_id
+
+    #     # Initial pairs with their positions
+    #     pairs = {}
+    #     for i in range(len(tokens) - 1):
+    #         pair = (tokens[i], tokens[i + 1])
+    #         if pair in merge_ranks:
+    #             pairs[i] = pair
+
+    #     # Min-heap: (rank, position, pair)
+    #     import heapq
+    #     heap = []
+    #     for pos, pair in pairs.items():
+    #         heapq.heappush(heap, (merge_ranks[pair], pos, pair))
+
+    #     while heap:
+    #         rank, pos, pair = heapq.heappop(heap)
+
+    #         # Ensure pair is still valid (not stale)
+    #         if pos >= len(tokens) - 1 or (tokens[pos], tokens[pos + 1]) != pair:
+    #             continue
+
+    #         merged_token = pair[0] + pair[1]
+    #         if merged_token not in byte_to_id:
+    #             continue
+
+    #         # Merge the pair at pos and pos + 1
+    #         tokens = tokens[:pos] + [merged_token] + tokens[pos + 2:]
+
+    #         # Rebuild heap around changed positions
+    #         heap = []
+    #         for i in range(len(tokens) - 1):
+    #             pair = (tokens[i], tokens[i + 1])
+    #             if pair in merge_ranks:
+    #                 heapq.heappush(heap, (merge_ranks[pair], i, pair))
+
+    #     return [byte_to_id[tok] for tok in tokens]
+
+    
+
+
 
     def decode(self, token_ids: List[int]) -> str:
         """
@@ -278,5 +418,5 @@ class Tokenizer:
             for token_id in self.encode(chunk):
                 yield token_id
             count += 1
-            if count % 10000 == 0:
+            if count % 100000 == 0:
                 print(f"[Tokenizer.encode_iterable] Processed {count} lines...")
