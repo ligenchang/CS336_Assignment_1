@@ -242,13 +242,12 @@ class Tokenizer:
     def encode_iterable(self, iterable: Iterator[str]) -> Iterator[int]:
         """
         Memory-efficient encoding of an iterable of strings.
-        
-        Args:
-            iterable: An iterable of strings
-            
-        Returns:
-            An iterator of token ids
+        Logs progress every 10000 lines.
         """
+        count = 0
         for chunk in iterable:
             for token_id in self.encode(chunk):
                 yield token_id
+            count += 1
+            if count % 10000 == 0:
+                print(f"[Tokenizer.encode_iterable] Processed {count} lines...")
