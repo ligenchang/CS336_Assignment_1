@@ -1,4 +1,5 @@
 import os
+import io
 import time
 import torch
 import numpy as np
@@ -7,6 +8,13 @@ from cs336_basics.tokenizer import Tokenizer
 from cs336_basics.nn_utils import transformer_lm, cross_entropy
 from cs336_basics.optimizer import AdamW
 from cs336_basics.lr_scheduler import get_lr_cosine_schedule
+
+# S3 support
+try:
+    import boto3
+    s3_available = True
+except ImportError:
+    s3_available = False
 
 def get_batch(tokens, batch_size, context_length, device):
     idx = np.random.randint(0, len(tokens) - context_length - 1, size=(batch_size,))
@@ -22,23 +30,49 @@ def save_checkpoint(weights, optimizer, iteration, out):
         'optimizer': optimizer.state_dict(),
         'iteration': iteration
     }
-    torch.save(checkpoint, out)
+    if out.startswith('s3://'):
+        if not s3_available:
+            raise RuntimeError('boto3 is required for S3 checkpointing')
+        bucket, key = out[5:].split('/', 1)
+        buffer = io.BytesIO()
+        torch.save(checkpoint, buffer)
+        buffer.seek(0)
+        boto3.client('s3').upload_fileobj(buffer, bucket, key)
+    else:
+        torch.save(checkpoint, out)
 
 def main():
     # Hyperparameters (same as TinyStories)
-    vocab_size = 10000
-    context_length = 256
-    d_model = 512
-    d_ff = 1344
-    num_layers = 4
-    num_heads = 16
+    # vocab_size = 32000
+    # context_length = 512
+    # d_model = 512
+    # d_ff = 1344
+    # num_layers = 8
+    # num_heads = 16
+    # rope_theta = 10000
+    # batch_size = 32
+    # num_steps = 100000
+    vocab_size = 32000
+    context_length = 512         # You can increase to 768 if memory allows
+    d_model = 512                # Can try up to 768, but 512 is stable
+    d_ff = 2048                  # Typically 4× d_model for better representation
+    num_layers = 10              # 8-12 layers is good balance; 10 here
+    num_heads = 8                # 8 heads fit better with d_model=512 (head_dim=64)
     rope_theta = 10000
-    batch_size = 32
-    num_steps = 50000
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    batch_size = 32              # Mixed precision recommended; can go up to 64 otherwise 32
+    num_steps = 100000
+
+    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     tokens_path = "openwebtext_pretok_tokens.pkl"  # Pre-tokenized OWT data
-    checkpoint_path = "openwebtext_transformer_ckpt.pt"
+    checkpoint_path = os.environ.get("CHECKPOINT_PATH", "openwebtext_transformer_ckpt.pt")
     curve_path = "openwebtext_learning_curve.npy"
+    print(f"Using device: {device}")
+
+    # Optimizer hyperparameters (must be defined before any optimizer usage)
+    base_lr = 9e-4
+    min_lr = 2e-5
+    warmup_iters = int(0.05 * num_steps)
+    cosine_cycle_iters = num_steps - warmup_iters
 
     # Load tokenized OWT data
     with open(tokens_path, "rb") as f:
@@ -73,14 +107,41 @@ def main():
         torch.nn.init.trunc_normal_(lm_head, mean=0.0, std=0.02, a=-0.04, b=0.04)
         weights["lm_head.weight"] = torch.nn.Parameter(lm_head, requires_grad=True)
         return weights
-    weights = init_weights()
 
-    # Optimizer
-    base_lr = 9e-4
-    optimizer = AdamW(weights.values(), lr=base_lr, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
-    min_lr = 2e-5
-    warmup_iters = int(0.05 * num_steps)
-    cosine_cycle_iters = num_steps - warmup_iters
+    # Try to resume from checkpoint if using CUDA and checkpoint exists
+    start_step = 0
+    if device.type == "cuda" and checkpoint_path.startswith("s3://") and s3_available:
+        bucket, key = checkpoint_path[5:].split('/', 1)
+        s3 = boto3.client('s3')
+        try:
+            buffer = io.BytesIO()
+            s3.download_fileobj(bucket, key, buffer)
+            buffer.seek(0)
+            checkpoint = torch.load(buffer, map_location=device)
+            weights = {k: v.to(device).clone().detach().requires_grad_(True) for k, v in checkpoint['weights'].items()}
+            optimizer = AdamW(weights.values(), lr=base_lr, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            start_step = checkpoint.get('iteration', 0) + 1
+            print(f"Resumed from S3 checkpoint at step {start_step}")
+        except Exception as e:
+            print(f"Could not load S3 checkpoint: {e}\nStarting from scratch.")
+            weights = init_weights()
+            optimizer = AdamW(weights.values(), lr=base_lr, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
+    elif os.path.exists(checkpoint_path):
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            weights = {k: v.to(device).clone().detach().requires_grad_(True) for k, v in checkpoint['weights'].items()}
+            optimizer = AdamW(weights.values(), lr=base_lr, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            start_step = checkpoint.get('iteration', 0) + 1
+            print(f"Resumed from local checkpoint at step {start_step}")
+        except Exception as e:
+            print(f"Could not load local checkpoint: {e}\nStarting from scratch.")
+            weights = init_weights()
+            optimizer = AdamW(weights.values(), lr=base_lr, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
+    else:
+        weights = init_weights()
+        optimizer = AdamW(weights.values(), lr=base_lr, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
 
     # Training loop
     def log(msg):
@@ -90,24 +151,40 @@ def main():
     log(f"Checkpoint will be saved to: {checkpoint_path}")
     losses = []
     best_loss = float('inf')
-    for step in range(num_steps):
+    use_amp = device.type == "cuda"
+    for step in range(start_step, num_steps):
         for param_group in optimizer.param_groups:
             param_group["lr"] = get_lr_cosine_schedule(
                 step, base_lr, min_lr, warmup_iters, cosine_cycle_iters
             )
         x, y = get_batch(tokens, batch_size, context_length, device)
-        logits = transformer_lm(
-            vocab_size=vocab_size,
-            context_length=context_length,
-            d_model=d_model,
-            num_layers=num_layers,
-            num_heads=num_heads,
-            d_ff=d_ff,
-            rope_theta=rope_theta,
-            weights=weights,
-            in_indices=x
-        )
-        loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+        if use_amp:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                logits = transformer_lm(
+                    vocab_size=vocab_size,
+                    context_length=context_length,
+                    d_model=d_model,
+                    num_layers=num_layers,
+                    num_heads=num_heads,
+                    d_ff=d_ff,
+                    rope_theta=rope_theta,
+                    weights=weights,
+                    in_indices=x
+                )
+                loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+        else:
+            logits = transformer_lm(
+                vocab_size=vocab_size,
+                context_length=context_length,
+                d_model=d_model,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                rope_theta=rope_theta,
+                weights=weights,
+                in_indices=x
+            )
+            loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()

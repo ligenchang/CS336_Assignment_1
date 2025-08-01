@@ -50,6 +50,7 @@ def pretokenize_chunk(args):
     tokens = []
     chunk_size = 64 * 1024 * 1024  # 64MB
 
+
     with open(raw_text_path, "rb") as f:
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         pos = start
@@ -78,6 +79,10 @@ def pretokenize_chunk(args):
 
             pos = read_end
             subchunk_idx += 1
+
+            # Progress reporting
+            percent = 100.0 * (pos - start) / total_bytes if total_bytes > 0 else 100.0
+            ts(f"[Chunk {chunk_idx}] Progress: {percent:.1f}% ({pos - start}/{total_bytes} bytes)")
 
         if leftover:
             try:
