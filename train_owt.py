@@ -60,7 +60,7 @@ def main():
     num_layers = 10              # 8-12 layers is good balance; 10 here
     num_heads = 8                # 8 heads fit better with d_model=512 (head_dim=64)
     rope_theta = 10000
-    batch_size = 32              # Mixed precision recommended; can go up to 64 otherwise 32
+    batch_size = 64              # Mixed precision recommended; can go up to 64 otherwise 32
     num_steps = 100000
 
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
@@ -204,3 +204,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
