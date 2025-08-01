@@ -28,7 +28,8 @@ def save_checkpoint(weights, optimizer, iteration, out):
     checkpoint = {
         'weights': {k: v.detach().cpu() for k, v in weights.items()},
         'optimizer': optimizer.state_dict(),
-        'iteration': iteration
+        'iteration': iteration,
+        'best_loss': globals().get('best_loss', float('inf'))
     }
     if out.startswith('s3://'):
         if not s3_available:
@@ -69,7 +70,7 @@ def main():
     print(f"Using device: {device}")
 
     # Optimizer hyperparameters (must be defined before any optimizer usage)
-    base_lr = 9e-4
+    base_lr = 5e-4
     min_lr = 2e-5
     warmup_iters = int(0.05 * num_steps)
     cosine_cycle_iters = num_steps - warmup_iters
@@ -150,7 +151,10 @@ def main():
     log("Starting training on OpenWebText...")
     log(f"Checkpoint will be saved to: {checkpoint_path}")
     losses = []
+    # Restore best_loss from checkpoint if available
     best_loss = float('inf')
+    if 'checkpoint' in locals() and 'best_loss' in checkpoint:
+        best_loss = checkpoint['best_loss']
     use_amp = device.type == "cuda"
     for step in range(start_step, num_steps):
         for param_group in optimizer.param_groups:
