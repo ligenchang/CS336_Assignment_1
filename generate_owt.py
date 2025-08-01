@@ -20,15 +20,27 @@ def main():
     parser.add_argument('--merges', type=str, default='owt_bpe_merges.pkl')
     parser.add_argument('--context_length', type=int, default=256)
     parser.add_argument('--device', type=str, default='mps' if torch.backends.mps.is_available() else 'cpu')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (default: 1.0)')
+    parser.add_argument('--top_p', type=float, default=1.0, help='Top-p (nucleus) sampling probability (default: 1.0 = no filtering)')
     args = parser.parse_args()
 
     # Model hyperparameters (must match training)
-    vocab_size = 10000
-    d_model = 512
-    d_ff = 1344
-    num_layers = 4
-    num_heads = 16
+    # vocab_size = 10000
+    # d_model = 512
+    # d_ff = 1344
+    # num_layers = 4
+    # num_heads = 16
+    # rope_theta = 10000
+
+
+    vocab_size = 32000
+    context_length = 512         # You can increase to 768 if memory allows
+    d_model = 512                # Can try up to 768, but 512 is stable
+    d_ff = 2048                  # Typically 4× d_model for better representation
+    num_layers = 10              # 8-12 layers is good balance; 10 here
+    num_heads = 8                # 8 heads fit better with d_model=512 (head_dim=64)
     rope_theta = 10000
+
     context_length = args.context_length
     device = torch.device(args.device)
 
@@ -60,8 +72,30 @@ def main():
             weights=weights,
             in_indices=x
         )
-        # Get next token (greedy)
-        next_token = torch.argmax(logits[0, len(input_ids)-1]).item()
+        logits = logits[0, len(input_ids)-1].float()
+        # Apply temperature
+        if args.temperature != 1.0:
+            logits = logits / args.temperature
+        probs = torch.softmax(logits, dim=-1)
+        # Top-p (nucleus) sampling
+        if args.top_p < 1.0:
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            cutoff = cumulative_probs > args.top_p
+            if torch.any(cutoff):
+                last_included = torch.where(cutoff)[0][0].item() + 1
+                sorted_probs = sorted_probs[:last_included]
+                sorted_indices = sorted_indices[:last_included]
+                sorted_probs = sorted_probs / sorted_probs.sum()  # renormalize
+            else:
+                last_included = len(sorted_probs)
+            next_token = sorted_indices[torch.multinomial(sorted_probs, 1).item()].item()
+        else:
+            # Full softmax sampling
+            next_token = torch.multinomial(probs, 1).item()
+        # If temperature is very low, fall back to greedy
+        if args.temperature == 0:
+            next_token = torch.argmax(logits).item()
         generated.append(next_token)
         # Optionally, stop at end-of-text token
         if next_token == tokenizer.byte_to_id.get(b'<|endoftext|>', -1):
