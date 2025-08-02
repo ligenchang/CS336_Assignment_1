@@ -1,9 +1,12 @@
+
 import os
 import io
 import time
 import torch
 import numpy as np
 import pickle
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from cs336_basics.tokenizer import Tokenizer
 from cs336_basics.nn_utils import transformer_lm, cross_entropy
 from cs336_basics.optimizer import AdamW
@@ -24,12 +27,15 @@ def get_batch(tokens, batch_size, context_length, device):
     y = torch.tensor(y, dtype=torch.long, device=device)
     return x, y
 
-def save_checkpoint(weights, optimizer, iteration, out):
+def save_checkpoint(weights, optimizer, iteration, best_loss, out):
+    # Only save on rank 0
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
     checkpoint = {
         'weights': {k: v.detach().cpu() for k, v in weights.items()},
         'optimizer': optimizer.state_dict(),
         'iteration': iteration,
-        'best_loss': globals().get('best_loss', float('inf'))
+        'best_loss': best_loss
     }
     if out.startswith('s3://'):
         if not s3_available:
@@ -53,25 +59,66 @@ def main():
     # rope_theta = 10000
     # batch_size = 32
     # num_steps = 100000
-    vocab_size = 32000
-    context_length = 512         # You can increase to 768 if memory allows
-    d_model = 512                # Can try up to 768, but 512 is stable
-    d_ff = 2048                  # Typically 4× d_model for better representation
-    num_layers = 10              # 8-12 layers is good balance; 10 here
-    num_heads = 8                # 8 heads fit better with d_model=512 (head_dim=64)
-    rope_theta = 10000
-    batch_size = 64              # Mixed precision recommended; can go up to 64 otherwise 32
-    num_steps = 100000
 
-    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+
+    # vocab_size = 32000
+    # context_length = 512         # You can increase to 768 if memory allows
+    # d_model = 512                # Can try up to 768, but 512 is stable
+    # d_ff = 2048                  # Typically 4× d_model for better representation
+    # num_layers = 10              # 8-12 layers is good balance; 10 here
+    # num_heads = 8                # 8 heads fit better with d_model=512 (head_dim=64)
+    # rope_theta = 10000
+    # batch_size = 64              # Mixed precision recommended; can go up to 64 otherwise 32
+    # num_steps = 100000
+
+
+    vocab_size = 32000
+    context_length = 1024        # Match GPT-2 context length for better fluency
+    d_model = 768                # GPT-2 small hidden size
+    d_ff = 3072                  # 4x d_model, as in GPT-2
+    num_layers = 12              # GPT-2 small depth
+    num_heads = 12               # GPT-2 small heads (head_dim=64)
+    rope_theta = 10000
+    batch_size = 8               # Per GPU, fits in 11GB A10 with bf16/mixed precision
+    num_steps = 50000         # More steps for better convergence
+    accumulation_steps = 8       # Accumulate gradients to simulate batch_size*accumulation_steps
+
+
+    # vocab_size = 32000
+    # context_length = 1024
+    # d_model = 1024
+    # d_ff = 4096
+    # num_layers = 24
+    # num_heads = 16
+    # rope_theta = 10000
+    # batch_size = 64  # per GPU
+    # num_steps = 300000
+
+
+    # DDP setup
+    ddp = False
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        dist.init_process_group(backend='nccl')
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        torch.cuda.set_device(local_rank)
+        device = torch.device('cuda', local_rank)
+        ddp = True
+        rank = dist.get_rank()
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+        rank = 0
     tokens_path = "openwebtext_pretok_tokens.pkl"  # Pre-tokenized OWT data
     checkpoint_path = os.environ.get("CHECKPOINT_PATH", "openwebtext_transformer_ckpt.pt")
     curve_path = "openwebtext_learning_curve.npy"
-    print(f"Using device: {device}")
+    if rank == 0:
+        print(f"Using device: {device}")
 
     # Optimizer hyperparameters (must be defined before any optimizer usage)
-    base_lr = 5e-4
-    min_lr = 2e-5
+    # base_lr = 1e-4
+    # min_lr = 2e-5
+    base_lr = 5e-4   # was 1e-4
+    min_lr = 1e-5    # was 2e-5
+
     warmup_iters = int(0.05 * num_steps)
     cosine_cycle_iters = num_steps - warmup_iters
 
@@ -111,6 +158,9 @@ def main():
 
     # Try to resume from checkpoint if using CUDA and checkpoint exists
     start_step = 0
+    best_loss = float('inf')
+    checkpoint = None
+    
     if device.type == "cuda" and checkpoint_path.startswith("s3://") and s3_available:
         bucket, key = checkpoint_path[5:].split('/', 1)
         s3 = boto3.client('s3')
@@ -123,7 +173,8 @@ def main():
             optimizer = AdamW(weights.values(), lr=base_lr, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
             optimizer.load_state_dict(checkpoint['optimizer'])
             start_step = checkpoint.get('iteration', 0) + 1
-            print(f"Resumed from S3 checkpoint at step {start_step}")
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            print(f"Resumed from S3 checkpoint at step {start_step} with best_loss {best_loss:.4f}")
         except Exception as e:
             print(f"Could not load S3 checkpoint: {e}\nStarting from scratch.")
             weights = init_weights()
@@ -135,7 +186,8 @@ def main():
             optimizer = AdamW(weights.values(), lr=base_lr, betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
             optimizer.load_state_dict(checkpoint['optimizer'])
             start_step = checkpoint.get('iteration', 0) + 1
-            print(f"Resumed from local checkpoint at step {start_step}")
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            print(f"Resumed from local checkpoint at step {start_step} with best_loss {best_loss:.4f}")
         except Exception as e:
             print(f"Could not load local checkpoint: {e}\nStarting from scratch.")
             weights = init_weights()
@@ -150,19 +202,53 @@ def main():
 
     log("Starting training on OpenWebText...")
     log(f"Checkpoint will be saved to: {checkpoint_path}")
+    log(f"Current best loss to beat: {best_loss:.4f}")
     losses = []
-    # Restore best_loss from checkpoint if available
-    best_loss = float('inf')
-    if 'checkpoint' in locals() and 'best_loss' in checkpoint:
-        best_loss = checkpoint['best_loss']
+    # best_loss is already initialized above during checkpoint loading
     use_amp = device.type == "cuda"
+    # Use the updated GradScaler API (torch 2.0+)
+    try:
+        scaler = torch.amp.GradScaler('cuda') if use_amp else None  # Updated API
+    except TypeError:
+        scaler = torch.amp.GradScaler() if use_amp else None  # Fallback for older PyTorch
+    
+    # Mixed Precision Strategy:
+    # - Forward pass (activations): bfloat16 for memory efficiency and speed
+    # - Parameters: float32 for precision in weight updates
+    # - Gradients: float32 for stable optimization
+    # - Loss computation: float32 for numerical stability
+    
+    # Wrap weights in DDP if using DDP
+    if ddp:
+        # Convert weights dict to a torch.nn.Module for DDP
+        class WeightsModule(torch.nn.Module):
+            def __init__(self, weights):
+                super().__init__()
+                for k, v in weights.items():
+                    self.register_parameter(k.replace('.', '_'), v)
+            def forward(self, *args, **kwargs):
+                raise NotImplementedError()
+        weights_module = WeightsModule(weights)
+        weights_module = weights_module.to(device)
+        ddp_weights = DDP(weights_module, device_ids=[local_rank])
+        # Rebuild weights dict to point to DDP parameters
+        weights = {k: getattr(ddp_weights.module, k.replace('.', '_')) for k in weights.keys()}
+
+    optimizer.zero_grad()
+    accum_loss = 0.0  # Ensure accum_loss is always initialized
     for step in range(start_step, num_steps):
         for param_group in optimizer.param_groups:
             param_group["lr"] = get_lr_cosine_schedule(
                 step, base_lr, min_lr, warmup_iters, cosine_cycle_iters
             )
         x, y = get_batch(tokens, batch_size, context_length, device)
+        
+        # Mixed precision: forward pass in bfloat16, everything else in float32
         if use_amp:
+            # Ensure parameters are in float32
+            for param in weights.values():
+                param.data = param.data.float()
+            
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 logits = transformer_lm(
                     vocab_size=vocab_size,
@@ -175,6 +261,8 @@ def main():
                     weights=weights,
                     in_indices=x
                 )
+                # Convert logits back to float32 for loss computation
+                logits = logits.float()
                 loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
         else:
             logits = transformer_lm(
@@ -189,16 +277,33 @@ def main():
                 in_indices=x
             )
             loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-        optimizer.zero_grad()
+
+        # Gradient accumulation - loss and gradients stay in float32
+        loss = loss / accumulation_steps
         loss.backward()
-        optimizer.step()
-        losses.append(loss.item())
-        if step % 100 == 0:
-            log(f"Step {step}: loss={loss.item():.4f}, lr={optimizer.param_groups[0]['lr']:.6f}")
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            save_checkpoint(weights, optimizer, step, checkpoint_path)
-            log(f"Best model saved at step {step} with loss {best_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f} to {checkpoint_path}")
+
+        # Accumulate unscaled loss for reporting
+        if step % accumulation_steps == 0:
+            accum_loss = 0.0
+        accum_loss += loss.item()  # This is already divided by accumulation_steps
+
+        if (step + 1) % accumulation_steps == 0:
+            # Ensure gradients are in float32 before optimizer step
+            for param in weights.values():
+                if param.grad is not None:
+                    param.grad.data = param.grad.data.float()
+            
+            optimizer.step()
+            optimizer.zero_grad()
+            avg_loss = accum_loss  # Since each loss is already divided, sum over accumulation_steps gives average
+            losses.append(avg_loss)
+            if (step + 1) % 100 == 0:
+                log(f"Step {step + 1}: loss={avg_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f}")
+            # Only check/save checkpoint after optimizer step
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                save_checkpoint(weights, optimizer, step, best_loss, checkpoint_path)
+                log(f"Best model saved at step {step + 1} with loss {best_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f} to {checkpoint_path}")
     np.save(curve_path, np.array(losses))
     log("Training finished. Learning curve saved.")
 

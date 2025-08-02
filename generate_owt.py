@@ -33,12 +33,20 @@ def main():
     # rope_theta = 10000
 
 
+    # vocab_size = 32000
+    # context_length = 512         # You can increase to 768 if memory allows
+    # d_model = 512                # Can try up to 768, but 512 is stable
+    # d_ff = 2048                  # Typically 4× d_model for better representation
+    # num_layers = 10              # 8-12 layers is good balance; 10 here
+    # num_heads = 8                # 8 heads fit better with d_model=512 (head_dim=64)
+    # rope_theta = 10000
+
     vocab_size = 32000
-    context_length = 512         # You can increase to 768 if memory allows
-    d_model = 512                # Can try up to 768, but 512 is stable
-    d_ff = 2048                  # Typically 4× d_model for better representation
-    num_layers = 10              # 8-12 layers is good balance; 10 here
-    num_heads = 8                # 8 heads fit better with d_model=512 (head_dim=64)
+    context_length = 1024        # Match GPT-2 context length for better fluency
+    d_model = 768                # GPT-2 small hidden size
+    d_ff = 3072                  # 4x d_model, as in GPT-2
+    num_layers = 12              # GPT-2 small depth
+    num_heads = 12               # GPT-2 small heads (head_dim=64)
     rope_theta = 10000
 
     context_length = args.context_length
