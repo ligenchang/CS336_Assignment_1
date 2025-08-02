@@ -27,7 +27,63 @@ def get_batch(tokens, batch_size, context_length, device):
     y = torch.tensor(y, dtype=torch.long, device=device)
     return x, y
 
-def save_checkpoint(weights, optimizer, iteration, best_loss, out):
+def validate_model(weights, tokens, batch_size, context_length, device, vocab_size, d_model, num_layers, num_heads, d_ff, rope_theta, use_amp=True, num_batches=10):
+    """Compute validation loss on a subset of data"""
+    total_loss = 0.0
+    num_samples = 0
+    
+    # Use different range for validation (last 10% of data)
+    val_start = int(0.9 * len(tokens))
+    val_tokens = tokens[val_start:]
+    
+    if len(val_tokens) < context_length + 1:
+        # Fallback to using a subset of training data
+        val_tokens = tokens[-min(len(tokens)//10, 100000):]
+    
+    with torch.no_grad():
+        for _ in range(num_batches):
+            # Sample from validation set
+            idx = np.random.randint(0, len(val_tokens) - context_length - 1, size=(batch_size,))
+            x = np.stack([val_tokens[i:i+context_length] for i in idx])
+            y = np.stack([val_tokens[i+1:i+context_length+1] for i in idx])
+            x = torch.tensor(x, dtype=torch.long, device=device)
+            y = torch.tensor(y, dtype=torch.long, device=device)
+            
+            if use_amp:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    logits = transformer_lm(
+                        vocab_size=vocab_size,
+                        context_length=context_length,
+                        d_model=d_model,
+                        num_layers=num_layers,
+                        num_heads=num_heads,
+                        d_ff=d_ff,
+                        rope_theta=rope_theta,
+                        weights=weights,
+                        in_indices=x
+                    )
+                    logits = logits.float()
+                    loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+            else:
+                logits = transformer_lm(
+                    vocab_size=vocab_size,
+                    context_length=context_length,
+                    d_model=d_model,
+                    num_layers=num_layers,
+                    num_heads=num_heads,
+                    d_ff=d_ff,
+                    rope_theta=rope_theta,
+                    weights=weights,
+                    in_indices=x
+                )
+                loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+            
+            total_loss += loss.item()
+            num_samples += 1
+    
+    return total_loss / num_samples if num_samples > 0 else float('inf')
+
+def save_checkpoint(weights, optimizer, iteration, best_loss, best_val_loss, out):
     # Only save on rank 0
     if dist.is_initialized() and dist.get_rank() != 0:
         return
@@ -35,7 +91,8 @@ def save_checkpoint(weights, optimizer, iteration, best_loss, out):
         'weights': {k: v.detach().cpu() for k, v in weights.items()},
         'optimizer': optimizer.state_dict(),
         'iteration': iteration,
-        'best_loss': best_loss
+        'best_loss': best_loss,
+        'best_val_loss': best_val_loss
     }
     if out.startswith('s3://'):
         if not s3_available:
@@ -117,7 +174,7 @@ def main():
     # base_lr = 1e-4
     # min_lr = 2e-5
     base_lr = 5e-4   # was 1e-4
-    min_lr = 1e-5    # was 2e-5
+    min_lr = 2e-5    # was 2e-5
 
     warmup_iters = int(0.05 * num_steps)
     cosine_cycle_iters = num_steps - warmup_iters
@@ -159,6 +216,7 @@ def main():
     # Try to resume from checkpoint if using CUDA and checkpoint exists
     start_step = 0
     best_loss = float('inf')
+    best_val_loss = float('inf')
     checkpoint = None
     
     if device.type == "cuda" and checkpoint_path.startswith("s3://") and s3_available:
@@ -174,7 +232,10 @@ def main():
             optimizer.load_state_dict(checkpoint['optimizer'])
             start_step = checkpoint.get('iteration', 0) + 1
             best_loss = checkpoint.get('best_loss', float('inf'))
-            print(f"Resumed from S3 checkpoint at step {start_step} with best_loss {best_loss:.4f}")
+            best_val_loss = checkpoint.get('best_val_loss', float('inf'))  # Default to inf if not present
+            print(f"Resumed from S3 checkpoint at step {start_step} with best_loss {best_loss:.4f}, best_val_loss {best_val_loss:.4f}")
+            if best_val_loss == float('inf'):
+                print("Note: No validation loss in checkpoint - will compute from scratch")
         except Exception as e:
             print(f"Could not load S3 checkpoint: {e}\nStarting from scratch.")
             weights = init_weights()
@@ -187,7 +248,10 @@ def main():
             optimizer.load_state_dict(checkpoint['optimizer'])
             start_step = checkpoint.get('iteration', 0) + 1
             best_loss = checkpoint.get('best_loss', float('inf'))
-            print(f"Resumed from local checkpoint at step {start_step} with best_loss {best_loss:.4f}")
+            best_val_loss = checkpoint.get('best_val_loss', float('inf'))  # Default to inf if not present
+            print(f"Resumed from local checkpoint at step {start_step} with best_loss {best_loss:.4f}, best_val_loss {best_val_loss:.4f}")
+            if best_val_loss == float('inf'):
+                print("Note: No validation loss in checkpoint - will compute from scratch")
         except Exception as e:
             print(f"Could not load local checkpoint: {e}\nStarting from scratch.")
             weights = init_weights()
@@ -202,7 +266,7 @@ def main():
 
     log("Starting training on OpenWebText...")
     log(f"Checkpoint will be saved to: {checkpoint_path}")
-    log(f"Current best loss to beat: {best_loss:.4f}")
+    log(f"Current best loss to beat: {best_loss:.4f}, best validation loss: {best_val_loss:.4f}")
     losses = []
     # best_loss is already initialized above during checkpoint loading
     use_amp = device.type == "cuda"
@@ -236,6 +300,17 @@ def main():
 
     optimizer.zero_grad()
     accum_loss = 0.0  # Ensure accum_loss is always initialized
+    
+    # If we resumed from an old checkpoint without validation loss, compute initial validation loss
+    if best_val_loss == float('inf') and start_step > 0:
+        log("Computing initial validation loss for resumed checkpoint...")
+        initial_val_loss = validate_model(
+            weights, tokens, batch_size, context_length, device,
+            vocab_size, d_model, num_layers, num_heads, d_ff, rope_theta, use_amp
+        )
+        best_val_loss = initial_val_loss
+        log(f"Initial validation loss: {initial_val_loss:.4f}")
+    
     for step in range(start_step, num_steps):
         for param_group in optimizer.param_groups:
             param_group["lr"] = get_lr_cosine_schedule(
@@ -297,13 +372,32 @@ def main():
             optimizer.zero_grad()
             avg_loss = accum_loss  # Since each loss is already divided, sum over accumulation_steps gives average
             losses.append(avg_loss)
+            
+            # Compute validation loss every 500 steps
+            val_loss = None
+            if (step + 1) % 500 == 0:
+                val_loss = validate_model(
+                    weights, tokens, batch_size, context_length, device,
+                    vocab_size, d_model, num_layers, num_heads, d_ff, rope_theta, use_amp
+                )
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+            
             if (step + 1) % 100 == 0:
-                log(f"Step {step + 1}: loss={avg_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f}")
+                val_info = f", val_loss={val_loss:.4f}" if val_loss is not None else ""
+                log(f"Step {step + 1}: loss={avg_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f}{val_info}")
+            
             # Only check/save checkpoint after optimizer step
             if avg_loss < best_loss:
                 best_loss = avg_loss
-                save_checkpoint(weights, optimizer, step, best_loss, checkpoint_path)
+                save_checkpoint(weights, optimizer, step, best_loss, best_val_loss, checkpoint_path)
                 log(f"Best model saved at step {step + 1} with loss {best_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f} to {checkpoint_path}")
+            elif val_loss is not None and val_loss < best_val_loss:
+                # Save checkpoint if validation loss improved even if training loss didn't
+                best_val_loss = val_loss
+                val_checkpoint_path = checkpoint_path.replace('.pt', '_best_val.pt') 
+                save_checkpoint(weights, optimizer, step, best_loss, best_val_loss, val_checkpoint_path)
+                log(f"Best validation model saved at step {step + 1} with val_loss {best_val_loss:.4f} to {val_checkpoint_path}")
     np.save(curve_path, np.array(losses))
     log("Training finished. Learning curve saved.")
 
