@@ -128,12 +128,13 @@ def main():
     context_length = 1024  
     d_model = 768         
     d_ff = 3072           
-    num_layers = 16       
+    num_layers = 12       
     num_heads =  12      
     rope_theta = 10000
-    batch_size = 10   
+    batch_size = 12   
     num_steps = 100000     
     accumulation_steps = 8    
+    max_grad_norm = 1.0       # Gradient clipping threshold
 
     # DDP setup
     ddp = False
@@ -171,6 +172,10 @@ def main():
     # Model weights
     def init_weights():
         weights = {}
+        # Clear CUDA cache before initialization to reduce fragmentation
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        
         # Embedding: N(0, 1), truncated to [-3, 3]
         emb = torch.empty(vocab_size, d_model, device=device)
         torch.nn.init.trunc_normal_(emb, mean=0.0, std=1.0, a=-3.0, b=3.0)
@@ -204,6 +209,11 @@ def main():
         std_lm = (2.0 / (vocab_size + d_model)) ** 0.5
         torch.nn.init.trunc_normal_(lm_head, mean=0.0, std=std_lm, a=-3*std_lm, b=3*std_lm)
         weights["lm_head.weight"] = torch.nn.Parameter(lm_head, requires_grad=True)
+        
+        # Clear cache after weight initialization
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        
         return weights
 
     # Try to resume from checkpoint if using CUDA and checkpoint exists
@@ -266,6 +276,13 @@ def main():
     log("Starting training on OpenWebText...")
     log(f"Checkpoint will be saved to: {checkpoint_path}")
     log(f"Current best loss to beat: {best_loss:.4f}, best validation loss: {best_val_loss:.4f}")
+    
+    # Print memory usage
+    if device.type == "cuda":
+        allocated = torch.cuda.memory_allocated(device) / 1024**3
+        reserved = torch.cuda.memory_reserved(device) / 1024**3
+        log(f"GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+    
     losses = []
     # best_loss is already initialized above during checkpoint loading
     use_amp = device.type == "cuda"
@@ -354,10 +371,14 @@ def main():
             )
         # Compute main loss
         loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+        
         # Auxiliary z_loss: encourage log(Z) ~ 0 for stability
         # Z = sum(exp(logits)) over vocab, per token
         # logZ = logsumexp(logits, dim=-1)
         # Take mean over all tokens in batch
+        # Note: We use both z_loss AND gradient clipping for maximum stability:
+        # - z_loss prevents logits from growing too large (forward pass stability)
+        # - gradient clipping prevents exploding gradients (backward pass stability)
         z_loss = 1e-4 * torch.mean(torch.logsumexp(logits, dim=-1))
         loss = loss + z_loss
 
@@ -375,12 +396,15 @@ def main():
             for param in weights.values():
                 if param.grad is not None:
                     param.grad.data = param.grad.data.float()
-            
+
+            # Gradient clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(weights.values(), max_grad_norm)
+
             optimizer.step()
             optimizer.zero_grad()
             avg_loss = accum_loss  # Since each loss is already divided, sum over accumulation_steps gives average
             losses.append(avg_loss)
-            
+
             # Compute validation loss every 500 steps
             val_loss = None
             if (step + 1) % 500 == 0:
@@ -390,11 +414,11 @@ def main():
                 )
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-            
+
             if (step + 1) % 100 == 0:
                 val_info = f", val_loss={val_loss:.4f}" if val_loss is not None else ""
-                log(f"Step {step + 1}: loss={avg_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f}{val_info}")
-            
+                log(f"Step {step + 1}: loss={avg_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f}, grad_norm={grad_norm:.4f}{val_info}")
+
             # Only check/save checkpoint after optimizer step
             if avg_loss < best_loss:
                 best_loss = avg_loss

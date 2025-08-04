@@ -48,3 +48,11 @@ gunzip owt_valid.txt.gz
 cd ..
 ```
 
+# Greedy decoding (deterministic)
+python generate_owt.py --prompt "The future of AI" --temperature 0.0 --length 50
+
+# Creative sampling
+python generate_owt.py --prompt "Once upon a time" --temperature 1.2 --top_p 0.9 --length 100
+
+# Focused sampling (nucleus)
+python generate_owt.py --prompt "In machine learning" --temperature 0.8 --top_p 0.7 --length 200

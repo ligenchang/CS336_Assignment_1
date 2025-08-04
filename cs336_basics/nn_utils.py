@@ -136,7 +136,7 @@ def scaled_dot_product_attention(
         
         # Apply mask if provided
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
+            scores = scores.masked_fill(~mask, -1e9)
         
         # Apply softmax to get attention weights
         attn_weights = softmax(scores, dim=-1)
@@ -144,59 +144,77 @@ def scaled_dot_product_attention(
         # Compute the weighted sum (attention weights · V)
         return torch.matmul(attn_weights, V)
 
-def rope(
-    d_k: int,
-    theta: float,
-    max_seq_len: int,
-    in_query_or_key: Tensor,
-    token_positions: Tensor
-) -> Tensor:
+class RotaryPositionalEmbedding(torch.nn.Module):
     """
-    Applies Rotary Position Embedding (RoPE) to a tensor.
+    Implements Rotary Position Embeddings (RoPE) as described in Su et al. 2021.
     
-    Args:
-        d_k (int): Embedding dimension size.
-        theta (float): Base value for frequency computation.
-        max_seq_len (int): Maximum sequence length.
-        in_query_or_key (Tensor): Input tensor of shape (..., seq_len, d_k).
-        token_positions (Tensor): Tensor of token positions of shape (..., seq_len).
+    RoPE applies pairwise rotations to query and key vectors based on their positions,
+    enabling relative positional encoding without learnable parameters.
+    """
+    
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        """
+        Initialize RoPE module with precomputed frequency values.
         
-    Returns:
-        Tensor: Output tensor with RoPE applied.
-    """
-    # Create position-dependent rotation angles
-    dim_pos = torch.arange(0, d_k, 2, device=in_query_or_key.device).float()
-    freqs = 1.0 / (theta ** (dim_pos / d_k))
+        Args:
+            theta (float): Base value Θ for frequency computation
+            d_k (int): Dimension of query and key vectors  
+            max_seq_len (int): Maximum sequence length that will be inputted
+            device (torch.device | None): Device to store the buffer on
+        """
+        super().__init__()
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+        
+        # Create frequency tensor for positions 0, 2, 4, ..., d_k-2
+        dim_pos = torch.arange(0, d_k, 2, dtype=torch.float32, device=device)
+        freqs = 1.0 / (theta ** (dim_pos / d_k))
+        
+        # Register frequencies as a buffer (not saved in state_dict)
+        self.register_buffer('freqs', freqs, persistent=False)
     
-    # Make sure token_positions has the right shape
-    if token_positions.dim() < in_query_or_key.dim() - 1:
-        # Add batch dimensions if needed
-        token_positions = token_positions.view(*([1] * (in_query_or_key.dim() - token_positions.dim() - 1)), *token_positions.shape)
-    
-    # Compute rotation angles based on token positions
-    angles = token_positions.unsqueeze(-1) * freqs
-    
-    # Compute sine and cosine
-    sin = torch.sin(angles)
-    cos = torch.cos(angles)
-    
-    # Prepare sin and cos for rotation
-    sin_pos = torch.cat([sin, sin], dim=-1)
-    cos_pos = torch.cat([cos, cos], dim=-1)
-    
-    # Apply rotation:
-    # For even indices (0, 2, 4, ...): x_i = x_i * cos - x_(i+1) * sin
-    # For odd indices (1, 3, 5, ...): x_i = x_(i-1) * sin + x_i * cos
-    # Reshape for easier manipulation
-    shape = in_query_or_key.shape
-    x = in_query_or_key.view(*shape[:-1], -1, 2)
-    
-    # Compute rotations
-    y1 = x[..., 0] * cos - x[..., 1] * sin
-    y2 = x[..., 0] * sin + x[..., 1] * cos
-    
-    # Reshape back to original shape
-    return torch.stack([y1, y2], dim=-1).view(*shape)
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        """
+        Apply RoPE to input tensor.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., seq_len, d_k)
+            token_positions (torch.Tensor): Token positions of shape (..., seq_len)
+            
+        Returns:
+            torch.Tensor: Rotated tensor of same shape as input
+        """
+        # Make sure token_positions has the right shape
+        if token_positions.dim() < x.dim() - 1:
+            # Add batch dimensions if needed
+            print("Alerting!!!!!Reshaping token positions for RoPE")
+            token_positions = token_positions.view(*([1] * (x.dim() - token_positions.dim() - 1)), *token_positions.shape)
+        
+        # Compute rotation angles based on token positions
+        angles = token_positions.unsqueeze(-1) * self.freqs
+        
+        # Compute sine and cosine
+        sin = torch.sin(angles)
+        cos = torch.cos(angles)
+        
+        # Prepare sin and cos for rotation
+        sin_pos = torch.cat([sin, sin], dim=-1)
+        cos_pos = torch.cat([cos, cos], dim=-1)
+        
+        # Apply rotation:
+        # For even indices (0, 2, 4, ...): x_i = x_i * cos - x_(i+1) * sin
+        # For odd indices (1, 3, 5, ...): x_i = x_(i-1) * sin + x_i * cos
+        # Reshape for easier manipulation
+        shape = x.shape
+        x_reshaped = x.view(*shape[:-1], -1, 2)
+        
+        # Compute rotations
+        y1 = x_reshaped[..., 0] * cos - x_reshaped[..., 1] * sin
+        y2 = x_reshaped[..., 0] * sin + x_reshaped[..., 1] * cos
+        
+        # Reshape back to original shape
+        return torch.stack([y1, y2], dim=-1).view(*shape)
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
@@ -269,12 +287,12 @@ def multihead_self_attention(
         # Fallback to manual implementation
         # Create causal mask to prevent attending to future tokens
         # Shape: [seq_len, seq_len]
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=in_features.device), diagonal=1).bool()
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=in_features.device)).bool()
         causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
         
         # Apply scaled dot-product attention with causal mask
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-        scores = scores.masked_fill(causal_mask, -1e9)  # Apply causal mask
+        scores = scores.masked_fill(~causal_mask, -1e9)  # Apply causal mask
         
         # Apply softmax to get attention weights
         attn_weights = softmax(scores, dim=-1)
@@ -340,10 +358,11 @@ def multihead_self_attention_with_rope(
     if token_positions is None:
         token_positions = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
     
-    # Apply RoPE to queries and keys for each head
+    # Create RoPE module and apply to queries and keys for each head
+    rope_module = RotaryPositionalEmbedding(theta, head_dim, max_seq_len, device=device)
     for i in range(num_heads):
-        q[:, i] = rope(head_dim, theta, max_seq_len, q[:, i], token_positions)
-        k[:, i] = rope(head_dim, theta, max_seq_len, k[:, i], token_positions)
+        q[:, i] = rope_module(q[:, i], token_positions)
+        k[:, i] = rope_module(k[:, i], token_positions)
     
     if use_flash and hasattr(F, 'scaled_dot_product_attention'):
         # Use PyTorch's optimized scaled_dot_product_attention with causal mask
@@ -356,12 +375,12 @@ def multihead_self_attention_with_rope(
     else:
         # Fallback to manual implementation
         # Create causal mask to prevent attending to future tokens
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).bool()
         causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
         
         # Apply scaled dot-product attention with causal mask
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-        scores = scores.masked_fill(causal_mask, -1e9)  # Apply causal mask
+        scores = scores.masked_fill(~causal_mask, -1e9)  # Apply causal mask
         
         # Apply softmax to get attention weights
         attn_weights = softmax(scores, dim=-1)

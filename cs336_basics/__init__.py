@@ -14,7 +14,7 @@ from .nn_utils import (
     silu, 
     scaled_dot_product_attention, 
     RMSNorm,
-    rope, 
+    RotaryPositionalEmbedding,
     multihead_self_attention, 
     multihead_self_attention_with_rope,
     swiglu,
