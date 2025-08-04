@@ -19,13 +19,30 @@ try:
 except ImportError:
     s3_available = False
 
-def get_batch(tokens, batch_size, context_length, device):
-    idx = np.random.randint(0, len(tokens) - context_length - 1, size=(batch_size,))
-    x = np.stack([tokens[i:i+context_length] for i in idx])
-    y = np.stack([tokens[i+1:i+context_length+1] for i in idx])
-    x = torch.tensor(x, dtype=torch.long, device=device)
-    y = torch.tensor(y, dtype=torch.long, device=device)
-    return x, y
+def get_batch(tokens, batch_size, context_length, device, data_pointer):
+    """Get a batch of data sequentially from the dataset"""
+    # Ensure we don't go out of bounds
+    max_start = len(tokens) - context_length - 1
+    
+    batch_x = []
+    batch_y = []
+    
+    for _ in range(batch_size):
+        if data_pointer >= max_start:
+            data_pointer = 0  # Wrap around to start of dataset
+        
+        x = tokens[data_pointer:data_pointer + context_length]
+        y = tokens[data_pointer + 1:data_pointer + context_length + 1]
+        
+        batch_x.append(x)
+        batch_y.append(y)
+        
+        data_pointer += context_length  # Move forward by context_length tokens
+    
+    x = torch.tensor(np.stack(batch_x), dtype=torch.long, device=device)
+    y = torch.tensor(np.stack(batch_y), dtype=torch.long, device=device)
+    
+    return x, y, data_pointer
 
 def validate_model(weights, tokens, batch_size, context_length, device, vocab_size, d_model, num_layers, num_heads, d_ff, rope_theta, use_amp=True, num_batches=10):
     """Compute validation loss on a subset of data"""
@@ -106,51 +123,17 @@ def save_checkpoint(weights, optimizer, iteration, best_loss, best_val_loss, out
         torch.save(checkpoint, out)
 
 def main():
-    # Hyperparameters (same as TinyStories)
-    # vocab_size = 32000
-    # context_length = 512
-    # d_model = 512
-    # d_ff = 1344
-    # num_layers = 8
-    # num_heads = 16
-    # rope_theta = 10000
-    # batch_size = 32
-    # num_steps = 100000
-
-
-    # vocab_size = 32000
-    # context_length = 512         # You can increase to 768 if memory allows
-    # d_model = 512                # Can try up to 768, but 512 is stable
-    # d_ff = 2048                  # Typically 4× d_model for better representation
-    # num_layers = 10              # 8-12 layers is good balance; 10 here
-    # num_heads = 8                # 8 heads fit better with d_model=512 (head_dim=64)
-    # rope_theta = 10000
-    # batch_size = 64              # Mixed precision recommended; can go up to 64 otherwise 32
-    # num_steps = 100000
-
 
     vocab_size = 32000
-    context_length = 1024        # Match GPT-2 context length for better fluency
-    d_model = 768                # GPT-2 small hidden size
-    d_ff = 3072                  # 4x d_model, as in GPT-2
-    num_layers = 12              # GPT-2 small depth
-    num_heads = 12               # GPT-2 small heads (head_dim=64)
+    context_length = 1024  
+    d_model = 768         
+    d_ff = 3072           
+    num_layers = 16       
+    num_heads =  12      
     rope_theta = 10000
-    batch_size = 8               # Per GPU, fits in 11GB A10 with bf16/mixed precision
-    num_steps = 50000         # More steps for better convergence
-    accumulation_steps = 8       # Accumulate gradients to simulate batch_size*accumulation_steps
-
-
-    # vocab_size = 32000
-    # context_length = 1024
-    # d_model = 1024
-    # d_ff = 4096
-    # num_layers = 24
-    # num_heads = 16
-    # rope_theta = 10000
-    # batch_size = 64  # per GPU
-    # num_steps = 300000
-
+    batch_size = 10   
+    num_steps = 100000     
+    accumulation_steps = 8    
 
     # DDP setup
     ddp = False
@@ -176,6 +159,7 @@ def main():
     base_lr = 5e-4   # was 1e-4
     min_lr = 2e-5    # was 2e-5
 
+    # Default scheduler parameters
     warmup_iters = int(0.05 * num_steps)
     cosine_cycle_iters = num_steps - warmup_iters
 
@@ -233,7 +217,10 @@ def main():
             start_step = checkpoint.get('iteration', 0) + 1
             best_loss = checkpoint.get('best_loss', float('inf'))
             best_val_loss = checkpoint.get('best_val_loss', float('inf'))  # Default to inf if not present
+            # Always use original schedule parameters - do not recalculate based on remaining steps
+            # The scheduler should continue from where it left off using the original full schedule
             print(f"Resumed from S3 checkpoint at step {start_step} with best_loss {best_loss:.4f}, best_val_loss {best_val_loss:.4f}")
+            print(f"Scheduler: using original schedule - warmup_iters={warmup_iters}, cosine_cycle_iters={cosine_cycle_iters}")
             if best_val_loss == float('inf'):
                 print("Note: No validation loss in checkpoint - will compute from scratch")
         except Exception as e:
@@ -249,7 +236,10 @@ def main():
             start_step = checkpoint.get('iteration', 0) + 1
             best_loss = checkpoint.get('best_loss', float('inf'))
             best_val_loss = checkpoint.get('best_val_loss', float('inf'))  # Default to inf if not present
+            # Always use original schedule parameters - do not recalculate based on remaining steps
+            # The scheduler should continue from where it left off using the original full schedule
             print(f"Resumed from local checkpoint at step {start_step} with best_loss {best_loss:.4f}, best_val_loss {best_val_loss:.4f}")
+            print(f"Scheduler: using original schedule - warmup_iters={warmup_iters}, cosine_cycle_iters={cosine_cycle_iters}")
             if best_val_loss == float('inf'):
                 print("Note: No validation loss in checkpoint - will compute from scratch")
         except Exception as e:
@@ -301,6 +291,9 @@ def main():
     optimizer.zero_grad()
     accum_loss = 0.0  # Ensure accum_loss is always initialized
     
+    # Initialize data pointer for sequential data access
+    data_pointer = 0
+    
     # If we resumed from an old checkpoint without validation loss, compute initial validation loss
     if best_val_loss == float('inf') and start_step > 0:
         log("Computing initial validation loss for resumed checkpoint...")
@@ -313,17 +306,17 @@ def main():
     
     for step in range(start_step, num_steps):
         for param_group in optimizer.param_groups:
+            # Use the global step directly with the original full schedule
             param_group["lr"] = get_lr_cosine_schedule(
                 step, base_lr, min_lr, warmup_iters, cosine_cycle_iters
             )
-        x, y = get_batch(tokens, batch_size, context_length, device)
+        x, y, data_pointer = get_batch(tokens, batch_size, context_length, device, data_pointer)
         
         # Mixed precision: forward pass in bfloat16, everything else in float32
         if use_amp:
             # Ensure parameters are in float32
             for param in weights.values():
                 param.data = param.data.float()
-            
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 logits = transformer_lm(
                     vocab_size=vocab_size,
@@ -338,7 +331,6 @@ def main():
                 )
                 # Convert logits back to float32 for loss computation
                 logits = logits.float()
-                loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
         else:
             logits = transformer_lm(
                 vocab_size=vocab_size,
@@ -351,7 +343,14 @@ def main():
                 weights=weights,
                 in_indices=x
             )
-            loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+        # Compute main loss
+        loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+        # Auxiliary z_loss: encourage log(Z) ~ 0 for stability
+        # Z = sum(exp(logits)) over vocab, per token
+        # logZ = logsumexp(logits, dim=-1)
+        # Take mean over all tokens in batch
+        z_loss = 1e-4 * torch.mean(torch.logsumexp(logits, dim=-1))
+        loss = loss + z_loss
 
         # Gradient accumulation - loss and gradients stay in float32
         loss = loss / accumulation_steps

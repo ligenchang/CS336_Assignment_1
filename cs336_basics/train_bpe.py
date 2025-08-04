@@ -22,12 +22,15 @@ def split_text_by_special_tokens(text: str, special_tokens: List[str]) -> List[s
 
 def pre_tokenize_text_with_special(text: str, special_tokens: List[str]) -> List[str]:
     parts = split_text_by_special_tokens(text, special_tokens)
+    # print("[pre_tokenize_text_with_special] Parts:", parts[0:1])
     tokens = []
     for part in parts:
         if part in special_tokens:
             tokens.append(part)
         else:
             tokens.extend([m.group() for m in GPT2_PATTERN.finditer(part)])
+            # print("[pre_tokenize_text_with_special] Found tokens:", tokens[0:100])
+    
     return tokens
 
 def find_chunk_boundaries(file: mmap.mmap, desired_num_chunks: int, split_special_token: bytes) -> list[int]:

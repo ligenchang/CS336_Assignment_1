@@ -19,12 +19,10 @@ def softmax(in_features: Tensor, dim: int) -> Tensor:
     """
     # Shift for numerical stability (helps prevent overflow)
     shifted_input = in_features - in_features.max(dim=dim, keepdim=True)[0]
-    
-    # Compute exponentials
     exp_x = torch.exp(shifted_input)
-    
-    # Normalize
-    return exp_x / exp_x.sum(dim=dim, keepdim=True)
+    # Use einsum for sum along the specified dimension for clarity
+    sum_exp = exp_x.sum(dim=dim, keepdim=True)
+    return exp_x / sum_exp
 
 def cross_entropy(inputs: Tensor, targets: Tensor) -> Tensor:
     """
@@ -93,35 +91,53 @@ def scaled_dot_product_attention(
     Q: Tensor,
     K: Tensor,
     V: Tensor,
-    mask: Optional[Tensor] = None
+    mask: Optional[Tensor] = None,
+    use_flash: bool = True
 ) -> Tensor:
     """
     Computes the scaled dot-product attention as described in the 'Attention is All You Need' paper.
+    Uses FlashAttention when available for better memory efficiency and speed.
     
     Args:
         Q (Tensor): Query tensor of shape (..., queries, d_k)
         K (Tensor): Key tensor of shape (..., keys, d_k)
         V (Tensor): Value tensor of shape (..., values, d_v)
         mask (Optional[Tensor]): Optional mask tensor of shape (..., queries, keys)
+        use_flash (bool): Whether to use PyTorch's optimized SDPA (FlashAttention when available)
         
     Returns:
         Tensor: Output tensor of shape (..., queries, d_v)
     """
-    # Get the dimension of the keys
-    d_k = K.size(-1)
-    
-    # Compute the scaled dot-product (Q·K^T / sqrt(d_k))
-    scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
-    
-    # Apply mask if provided
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
-    
-    # Apply softmax to get attention weights
-    attn_weights = softmax(scores, dim=-1)
-    
-    # Compute the weighted sum (attention weights · V)
-    return torch.matmul(attn_weights, V)
+    if use_flash and hasattr(F, 'scaled_dot_product_attention'):
+        # Use PyTorch's optimized scaled_dot_product_attention (includes FlashAttention)
+        # Convert mask format: PyTorch SDPA expects True for positions to attend to
+        attn_mask = None
+        if mask is not None:
+            attn_mask = mask.bool()
+        
+        return F.scaled_dot_product_attention(
+            Q, K, V, 
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False  # We handle causality with explicit mask
+        )
+    else:
+        # Fallback to manual implementation
+        # Get the dimension of the keys
+        d_k = K.size(-1)
+        
+        # Compute the scaled dot-product (Q·K^T / sqrt(d_k))
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
+        
+        # Apply mask if provided
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+        
+        # Apply softmax to get attention weights
+        attn_weights = softmax(scores, dim=-1)
+        
+        # Compute the weighted sum (attention weights · V)
+        return torch.matmul(attn_weights, V)
 
 def rope(
     d_k: int,
@@ -226,7 +242,8 @@ def multihead_self_attention(
     k_proj_weight: Tensor,
     v_proj_weight: Tensor,
     o_proj_weight: Tensor,
-    in_features: Tensor
+    in_features: Tensor,
+    use_flash: bool = True
 ) -> Tensor:
     """
     Implements multi-head self-attention as described in the 'Attention is All You Need' paper.
@@ -239,6 +256,7 @@ def multihead_self_attention(
         v_proj_weight (Tensor): Value projection weights.
         o_proj_weight (Tensor): Output projection weights.
         in_features (Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+        use_flash (bool): Whether to use optimized attention implementation.
         
     Returns:
         Tensor: Output tensor of shape (batch_size, seq_len, d_model).
@@ -257,20 +275,30 @@ def multihead_self_attention(
     k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
     v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
     
-    # Create causal mask to prevent attending to future tokens
-    # Shape: [seq_len, seq_len]
-    causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=in_features.device), diagonal=1).bool()
-    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
-    
-    # Apply scaled dot-product attention with causal mask
-    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-    scores = scores.masked_fill(causal_mask, -1e9)  # Apply causal mask
-    
-    # Apply softmax to get attention weights
-    attn_weights = softmax(scores, dim=-1)
-    
-    # Apply attention weights to values
-    attn_output = torch.matmul(attn_weights, v)
+    if use_flash and hasattr(F, 'scaled_dot_product_attention'):
+        # Use PyTorch's optimized scaled_dot_product_attention with causal mask
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True  # This handles the causal masking efficiently
+        )
+    else:
+        # Fallback to manual implementation
+        # Create causal mask to prevent attending to future tokens
+        # Shape: [seq_len, seq_len]
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=in_features.device), diagonal=1).bool()
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+        
+        # Apply scaled dot-product attention with causal mask
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        scores = scores.masked_fill(causal_mask, -1e9)  # Apply causal mask
+        
+        # Apply softmax to get attention weights
+        attn_weights = softmax(scores, dim=-1)
+        
+        # Apply attention weights to values
+        attn_output = torch.matmul(attn_weights, v)
     
     # Reshape back: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, d_model]
     attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
@@ -290,7 +318,8 @@ def multihead_self_attention_with_rope(
     v_proj_weight: Tensor,
     o_proj_weight: Tensor,
     in_features: Tensor,
-    token_positions: Tensor = None
+    token_positions: Tensor = None,
+    use_flash: bool = True
 ) -> Tensor:
     """
     Implements multi-head self-attention with Rotary Position Embedding (RoPE).
@@ -306,6 +335,7 @@ def multihead_self_attention_with_rope(
         o_proj_weight (Tensor): Output projection weights.
         in_features (Tensor): Input tensor of shape (batch_size, seq_len, d_model).
         token_positions (Tensor): Tensor of token positions of shape (batch_size, seq_len).
+        use_flash (bool): Whether to use optimized attention implementation.
         
     Returns:
         Tensor: Output tensor of shape (batch_size, seq_len, d_model).
@@ -333,19 +363,29 @@ def multihead_self_attention_with_rope(
         q[:, i] = rope(head_dim, theta, max_seq_len, q[:, i], token_positions)
         k[:, i] = rope(head_dim, theta, max_seq_len, k[:, i], token_positions)
     
-    # Create causal mask to prevent attending to future tokens
-    causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
-    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
-    
-    # Apply scaled dot-product attention with causal mask
-    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-    scores = scores.masked_fill(causal_mask, -1e9)  # Apply causal mask
-    
-    # Apply softmax to get attention weights
-    attn_weights = softmax(scores, dim=-1)
-    
-    # Apply attention weights to values
-    attn_output = torch.matmul(attn_weights, v)
+    if use_flash and hasattr(F, 'scaled_dot_product_attention'):
+        # Use PyTorch's optimized scaled_dot_product_attention with causal mask
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True  # This handles the causal masking efficiently
+        )
+    else:
+        # Fallback to manual implementation
+        # Create causal mask to prevent attending to future tokens
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+        
+        # Apply scaled dot-product attention with causal mask
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        scores = scores.masked_fill(causal_mask, -1e9)  # Apply causal mask
+        
+        # Apply softmax to get attention weights
+        attn_weights = softmax(scores, dim=-1)
+        
+        # Apply attention weights to values
+        attn_output = torch.matmul(attn_weights, v)
     
     # Reshape back: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, d_model]
     attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
@@ -386,10 +426,9 @@ def linear(
     Returns:
         torch.Tensor: The output tensor of shape (..., d_out).
     """
-    # Use the Linear class for consistency with the test adapter
-    mod = Linear(d_in, d_out)
-    mod.W.data.copy_(weights)
-    return mod(in_features)
+    # Use einsum for batched linear transformation: (..., d_in), (d_out, d_in) -> (..., d_out)
+    # Equivalent to torch.matmul but more explicit for batch dims
+    return torch.einsum('...i,oi->...o', in_features, weights)
 
 
 class Embedding(torch.nn.Module):
@@ -454,20 +493,14 @@ def swiglu(
     Returns:
         torch.Tensor: The output tensor of shape (..., d_model).
     """
-    # First projection
-    x1 = torch.matmul(in_features, w1_weight.t())
-    
-    # Second projection
-    x3 = torch.matmul(in_features, w3_weight.t())
-    
-    # Apply SiLU activation to the first projection
+    # Use einsum for all projections for clarity and batch-friendliness
+    # (..., d_model), (d_ff, d_model) -> (..., d_ff)
+    x1 = torch.einsum('...i,oi->...o', in_features, w1_weight)
+    x3 = torch.einsum('...i,oi->...o', in_features, w3_weight)
     x1_activated = silu(x1)
-    
-    # Element-wise multiplication
     x = x1_activated * x3
-    
-    # Final projection
-    return torch.matmul(x, w2_weight.t())
+    # (..., d_ff), (d_model, d_ff) -> (..., d_model)
+    return torch.einsum('...i,oi->...o', x, w2_weight)
 
 def transformer_block(
     d_model: int,

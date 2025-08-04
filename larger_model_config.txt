@@ -1,0 +1,13 @@
+# Alternative config for larger model (uncomment to use):
+# vocab_size = 32000
+# context_length = 1024        # Keep original context length
+# d_model = 1024               # Increase model dimension (GPT-2 medium size)
+# d_ff = 4096                  # 4x d_model
+# num_layers = 16              # More layers for better representation
+# num_heads = 16               # More heads (head_dim=64)
+# rope_theta = 10000
+# batch_size = 4               # Smaller batch size for larger model
+# num_steps = 75000            # More steps for larger model
+# accumulation_steps = 16      # Higher accumulation to maintain effective batch size
+
+# This config should use ~18-20GB memory, leaving some headroom

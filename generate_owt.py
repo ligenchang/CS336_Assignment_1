@@ -15,9 +15,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--prompt', type=str, required=True, help='Prompt text to start generation')
     parser.add_argument('--length', type=int, default=100, help='Number of tokens to generate')
-    parser.add_argument('--checkpoint', type=str, default='openwebtext_transformer_ckpt.pt')
-    parser.add_argument('--vocab', type=str, default='owt_bpe_vocab.pkl')
-    parser.add_argument('--merges', type=str, default='owt_bpe_merges.pkl')
+    parser.add_argument('--checkpoint', type=str, default='/Users/michaelli/Downloads/openwebtext_transformer_ckpt.pt')
+    parser.add_argument('--vocab', type=str, default='/Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_vocab.pkl')
+    parser.add_argument('--merges', type=str, default='/Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_merges.pkl')
     parser.add_argument('--context_length', type=int, default=256)
     parser.add_argument('--device', type=str, default='mps' if torch.backends.mps.is_available() else 'cpu')
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (default: 1.0)')
@@ -41,13 +41,22 @@ def main():
     # num_heads = 8                # 8 heads fit better with d_model=512 (head_dim=64)
     # rope_theta = 10000
 
+    # vocab_size = 32000
+    # context_length = 1024        # Match GPT-2 context length for better fluency
+    # d_model = 768                # GPT-2 small hidden size
+    # d_ff = 3072                  # 4x d_model, as in GPT-2
+    # num_layers = 12              # GPT-2 small depth
+    # num_heads = 12               # GPT-2 small heads (head_dim=64)
+    # rope_theta = 10000
+
     vocab_size = 32000
-    context_length = 1024        # Match GPT-2 context length for better fluency
+    context_length = 1024        # Increased from 1024 - better for long-form generation
     d_model = 768                # GPT-2 small hidden size
-    d_ff = 3072                  # 4x d_model, as in GPT-2
-    num_layers = 12              # GPT-2 small depth
-    num_heads = 12               # GPT-2 small heads (head_dim=64)
+    d_ff = 2048                  # 8/3 x d_model
+    num_layers = 8              # GPT-2 small depth
+    num_heads =  12              # GPT-2 small heads (head_dim=64)
     rope_theta = 10000
+ 
 
     context_length = args.context_length
     device = torch.device(args.device)
