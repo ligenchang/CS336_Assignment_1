@@ -171,29 +171,38 @@ def main():
     # Model weights
     def init_weights():
         weights = {}
+        # Embedding: N(0, 1), truncated to [-3, 3]
         emb = torch.empty(vocab_size, d_model, device=device)
-        torch.nn.init.trunc_normal_(emb, mean=0.0, std=0.02, a=-0.04, b=0.04)
+        torch.nn.init.trunc_normal_(emb, mean=0.0, std=1.0, a=-3.0, b=3.0)
         weights["token_embeddings.weight"] = torch.nn.Parameter(emb, requires_grad=True)
         for i in range(num_layers):
             prefix = f"layers.{i}."
+            # Linear weights: N(0, 2/(din+dout)), truncated to [-3σ, 3σ]
             for proj in ["attn.q_proj.weight", "attn.k_proj.weight", "attn.v_proj.weight", "attn.output_proj.weight"]:
                 w = torch.empty(d_model, d_model, device=device)
-                torch.nn.init.trunc_normal_(w, mean=0.0, std=0.02, a=-0.04, b=0.04)
+                std = (2.0 / (d_model + d_model)) ** 0.5
+                torch.nn.init.trunc_normal_(w, mean=0.0, std=std, a=-3*std, b=3*std)
                 weights[prefix + proj] = torch.nn.Parameter(w, requires_grad=True)
             weights[prefix + "ln1.weight"] = torch.nn.Parameter(torch.ones(d_model, device=device), requires_grad=True)
             weights[prefix + "ln2.weight"] = torch.nn.Parameter(torch.ones(d_model, device=device), requires_grad=True)
+            # FFN weights
             w1 = torch.empty(d_ff, d_model, device=device)
-            torch.nn.init.trunc_normal_(w1, mean=0.0, std=0.02, a=-0.04, b=0.04)
+            std1 = (2.0 / (d_ff + d_model)) ** 0.5
+            torch.nn.init.trunc_normal_(w1, mean=0.0, std=std1, a=-3*std1, b=3*std1)
             weights[prefix + "ffn.w1.weight"] = torch.nn.Parameter(w1, requires_grad=True)
             w2 = torch.empty(d_model, d_ff, device=device)
-            torch.nn.init.trunc_normal_(w2, mean=0.0, std=0.02, a=-0.04, b=0.04)
+            std2 = (2.0 / (d_model + d_ff)) ** 0.5
+            torch.nn.init.trunc_normal_(w2, mean=0.0, std=std2, a=-3*std2, b=3*std2)
             weights[prefix + "ffn.w2.weight"] = torch.nn.Parameter(w2, requires_grad=True)
             w3 = torch.empty(d_ff, d_model, device=device)
-            torch.nn.init.trunc_normal_(w3, mean=0.0, std=0.02, a=-0.04, b=0.04)
+            std3 = (2.0 / (d_ff + d_model)) ** 0.5
+            torch.nn.init.trunc_normal_(w3, mean=0.0, std=std3, a=-3*std3, b=3*std3)
             weights[prefix + "ffn.w3.weight"] = torch.nn.Parameter(w3, requires_grad=True)
         weights["ln_final.weight"] = torch.nn.Parameter(torch.ones(d_model, device=device), requires_grad=True)
+        # LM head: N(0, 2/(din+dout)), din=d_model, dout=vocab_size
         lm_head = torch.empty(vocab_size, d_model, device=device)
-        torch.nn.init.trunc_normal_(lm_head, mean=0.0, std=0.02, a=-0.04, b=0.04)
+        std_lm = (2.0 / (vocab_size + d_model)) ** 0.5
+        torch.nn.init.trunc_normal_(lm_head, mean=0.0, std=std_lm, a=-3*std_lm, b=3*std_lm)
         weights["lm_head.weight"] = torch.nn.Parameter(lm_head, requires_grad=True)
         return weights
 

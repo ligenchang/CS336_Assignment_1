@@ -4,6 +4,7 @@ from torch import Tensor
 from typing import Iterable, Union, Optional, Tuple
 from collections.abc import Iterable as IterableABC
 import math
+from einops import rearrange, einsum
 
 def softmax(in_features: Tensor, dim: int) -> Tensor:
     """
@@ -19,8 +20,11 @@ def softmax(in_features: Tensor, dim: int) -> Tensor:
     """
     # Shift for numerical stability (helps prevent overflow)
     shifted_input = in_features - in_features.max(dim=dim, keepdim=True)[0]
+    
+    # Compute exponentials
     exp_x = torch.exp(shifted_input)
-    # Use einsum for sum along the specified dimension for clarity
+    
+    # Normalize
     sum_exp = exp_x.sum(dim=dim, keepdim=True)
     return exp_x / sum_exp
 
@@ -42,6 +46,7 @@ def cross_entropy(inputs: Tensor, targets: Tensor) -> Tensor:
     log_probs = F.log_softmax(inputs, dim=-1)
     
     # Gather the log probabilities corresponding to the target classes
+    # The function implementation goes here
     nll_loss = -log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
     
     # Return the average loss
@@ -203,37 +208,14 @@ class RMSNorm(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_dtype = x.dtype
-        x = x.float()
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
+        # Compute RMS: sqrt(mean(x^2) + eps) over the last dimension (d_model)
         rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
-        normed = x / rms
-        out = normed * self.weight
-        return out.to(orig_dtype)  # <-- Add this line
-
-def rmsnorm(
-    d_model: int,
-    eps: float,
-    weights: Tensor,
-    in_features: Tensor
-) -> Tensor:
-    """
-    Applies Root Mean Square Layer Normalization using the RMSNorm module.
-    
-    Args:
-        d_model (int): Dimensionality of the input features.
-        eps (float): Small constant for numerical stability.
-        weights (Tensor): Scale parameters of shape (d_model,).
-        in_features (Tensor): Input tensor of shape (..., d_model).
-        
-    Returns:
-        Tensor: Normalized tensor of the same shape as in_features.
-    """
-    # Use the RMSNorm class for consistency with the test adapter
-    norm = RMSNorm(d_model, eps)
-    # Move weights to the same device as in_features
-    norm.weight.data.copy_(weights)
-    norm.weight = torch.nn.Parameter(norm.weight.data.to(in_features.device))
-    return norm(in_features)
+        # Apply RMSNorm: x / RMS(x) * gain
+        result = (x / rms) * self.weight
+        # Return the result in the original dtype
+        return result.to(in_dtype)
 
 def multihead_self_attention(
     d_model: int,
@@ -403,32 +385,13 @@ class Linear(torch.nn.Module):
         self.W = torch.nn.Parameter(
             torch.empty(out_features, in_features, device=device, dtype=dtype)
         )
-        torch.nn.init.trunc_normal_(self.W, std=0.02)
+        # Initialize with N(0, 2/(din+dout)), truncated to [-3σ, 3σ]
+        std = (2.0 / (in_features + out_features)) ** 0.5
+        torch.nn.init.trunc_normal_(self.W, mean=0.0, std=std, a=-3*std, b=3*std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.matmul(x, self.W.t())
-
-def linear(
-    d_in: int, 
-    d_out: int, 
-    weights: torch.Tensor, 
-    in_features: torch.Tensor
-) -> torch.Tensor:
-    """
-    Performs a linear transformation of the input.
-    
-    Args:
-        d_in (int): The input dimension.
-        d_out (int): The output dimension.
-        weights (torch.Tensor): The weight matrix of shape (d_out, d_in).
-        in_features (torch.Tensor): The input tensor of shape (..., d_in).
-        
-    Returns:
-        torch.Tensor: The output tensor of shape (..., d_out).
-    """
-    # Use einsum for batched linear transformation: (..., d_in), (d_out, d_in) -> (..., d_out)
-    # Equivalent to torch.matmul but more explicit for batch dims
-    return torch.einsum('...i,oi->...o', in_features, weights)
+        # Use einsum for batched linear transformation: (..., in_features), (out_features, in_features) -> (..., out_features)
+        return einsum(x, self.W, '... d_in, d_out d_in -> ... d_out')
 
 
 class Embedding(torch.nn.Module):
@@ -439,37 +402,13 @@ class Embedding(torch.nn.Module):
         self.weight = torch.nn.Parameter(
             torch.empty(num_embeddings, embedding_dim, device=device, dtype=dtype)
         )
-        torch.nn.init.trunc_normal_(self.weight, std=0.02)
+        # Initialize with N(0, 1), truncated to [-3, 3]
+        torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=1.0, a=-3.0, b=3.0)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        # Ensure weights are on the same device as token_ids
-        if self.weight.device != token_ids.device:
-            self.weight.data = self.weight.data.to(token_ids.device)
+        # Embedding lookup via advanced indexing (einsum doesn't support integer indexing)
+        # The weight tensor will automatically be moved to the correct device during forward pass
         return self.weight[token_ids]
-    
-def embedding(
-    vocab_size: int,
-    d_model: int,
-    weights: torch.Tensor,
-    token_ids: torch.Tensor
-) -> torch.Tensor:
-    """
-    Embeds token IDs using the provided embedding weights.
-
-    Args:
-        vocab_size (int): The size of the vocabulary.
-        d_model (int): The dimension of the embedding vectors.
-        weights (torch.Tensor): The embedding matrix of shape (vocab_size, d_model).
-        token_ids (torch.Tensor): The token IDs to embed of shape (...).
-
-    Returns:
-        torch.Tensor: The embedded tokens of shape (..., d_model).
-    """
-    # Use the custom Embedding class, ensure weights and token_ids are on the same device
-    device = token_ids.device
-    embedding_module = Embedding(vocab_size, d_model, device=device)
-    embedding_module.weight.data.copy_(weights.to(device))
-    return embedding_module(token_ids)
 
 def swiglu(
     d_model: int,
@@ -482,6 +421,9 @@ def swiglu(
     """
     Implements the SwiGLU activation function as used in modern transformer models.
     
+    SwiGLU(x, W1, W2, W3) = W2(SiLU(W1x) ⊙ W3x)
+    where SiLU(x) = x * σ(x) = x / (1 + exp(-x))
+    
     Args:
         d_model (int): The dimension of the model.
         d_ff (int): The dimension of the feed-forward layer.
@@ -493,14 +435,16 @@ def swiglu(
     Returns:
         torch.Tensor: The output tensor of shape (..., d_model).
     """
-    # Use einsum for all projections for clarity and batch-friendliness
-    # (..., d_model), (d_ff, d_model) -> (..., d_ff)
-    x1 = torch.einsum('...i,oi->...o', in_features, w1_weight)
-    x3 = torch.einsum('...i,oi->...o', in_features, w3_weight)
-    x1_activated = silu(x1)
-    x = x1_activated * x3
-    # (..., d_ff), (d_model, d_ff) -> (..., d_model)
-    return torch.einsum('...i,oi->...o', x, w2_weight)
+    # First projections: W1x and W3x
+    w1x = einsum(in_features, w1_weight, '... d_model, d_ff d_model -> ... d_ff')
+    w3x = einsum(in_features, w3_weight, '... d_model, d_ff d_model -> ... d_ff')
+    
+    # Apply SiLU activation to W1x and element-wise multiply with W3x
+    silu_w1x = silu(w1x)
+    gated = silu_w1x * w3x
+    
+    # Final projection: W2(SiLU(W1x) ⊙ W3x)
+    return einsum(gated, w2_weight, '... d_ff, d_model d_ff -> ... d_model')
 
 def transformer_block(
     d_model: int,
@@ -513,7 +457,7 @@ def transformer_block(
 ) -> torch.Tensor:
     """
     Implements a single pre-norm transformer block with RoPE.
-    
+
     Args:
         d_model (int): The dimension of the model.
         num_heads (int): The number of attention heads.
@@ -522,7 +466,7 @@ def transformer_block(
         theta (float): The RoPE theta parameter.
         weights (dict): A dictionary containing the weights for the transformer block.
         in_features (torch.Tensor): The input tensor of shape (batch, seq_len, d_model).
-        
+
     Returns:
         torch.Tensor: The output tensor of shape (batch, seq_len, d_model).
     """
@@ -544,9 +488,9 @@ def transformer_block(
     positions = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
     
     # First LayerNorm (pre-norm architecture)
-    normed_features = rmsnorm(d_model, 1e-5, ln1_weight, in_features)
-    
-    # Multi-head attention with RoPE
+    ln1 = RMSNorm(d_model, 1e-5, device=in_features.device, dtype=in_features.dtype)
+    ln1.weight.data.copy_(ln1_weight)
+    normed_features = ln1(in_features)
     attn_output = multihead_self_attention_with_rope(
         d_model=d_model,
         num_heads=num_heads,
@@ -564,7 +508,9 @@ def transformer_block(
     res1 = in_features + attn_output
     
     # Second LayerNorm (pre-norm for FFN)
-    normed_res1 = rmsnorm(d_model, 1e-5, ln2_weight, res1)
+    ln2 = RMSNorm(d_model, 1e-5, device=in_features.device, dtype=in_features.dtype)
+    ln2.weight.data.copy_(ln2_weight)
+    normed_res1 = ln2(res1)
     
     # Feed-forward network with SwiGLU
     ffn_output = swiglu(
@@ -612,13 +558,10 @@ def transformer_lm(
     batch_size, seq_len = in_indices.shape
     device = in_indices.device
     
-    # Embedding
-    token_embeddings = embedding(
-        vocab_size=vocab_size,
-        d_model=d_model,
-        weights=weights["token_embeddings.weight"],
-        token_ids=in_indices
-    )
+    # Embedding using the Embedding class
+    embedding_module = Embedding(vocab_size, d_model, device=device)
+    embedding_module.weight.data.copy_(weights["token_embeddings.weight"].to(device))
+    token_embeddings = embedding_module(in_indices)
 
     
     # Process through transformer layers
@@ -645,7 +588,9 @@ def transformer_lm(
     
     # Final layer norm
     ln_final_weight = weights["ln_final.weight"]
-    x = rmsnorm(d_model, 1e-5, ln_final_weight, x)
+    ln_final = RMSNorm(d_model, 1e-5, device=device, dtype=x.dtype)
+    ln_final.weight.data.copy_(ln_final_weight)
+    x = ln_final(x)
     
     # Language model head - project to vocabulary
     lm_head_weight = weights["lm_head.weight"]

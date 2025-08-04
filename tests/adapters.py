@@ -29,8 +29,16 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-    from cs336_basics import linear
-    return linear(d_in, d_out, weights, in_features)
+    from cs336_basics.nn_utils import Linear
+    
+    # Create Linear module
+    linear_module = Linear(d_in, d_out, device=weights.device, dtype=weights.dtype)
+    
+    # Load the provided weights into the module
+    linear_module.load_state_dict({'W': weights})
+    
+    # Apply the transformation
+    return linear_module(in_features)
 
 
 def run_embedding(
@@ -51,8 +59,16 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-    from cs336_basics import embedding
-    return embedding(vocab_size, d_model, weights, token_ids)
+    from cs336_basics.nn_utils import Embedding
+    
+    # Create Embedding module
+    embedding_module = Embedding(vocab_size, d_model, device=weights.device, dtype=weights.dtype)
+    
+    # Load the provided weights into the module
+    embedding_module.load_state_dict({'weight': weights})
+    
+    # Apply the embedding lookup
+    return embedding_module(token_ids)
 
 
 def run_swiglu(
@@ -401,8 +417,12 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    from cs336_basics import rmsnorm
-    return rmsnorm(d_model, eps, weights, in_features)
+    from cs336_basics.nn_utils import RMSNorm
+    
+    # Create RMSNorm module and load weights
+    norm = RMSNorm(d_model, eps, device=in_features.device, dtype=in_features.dtype)
+    norm.weight.data.copy_(weights)
+    return norm(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:

@@ -13,13 +13,13 @@ from .nn_utils import (
     gradient_clipping, 
     silu, 
     scaled_dot_product_attention, 
-    rmsnorm, 
+    RMSNorm,
     rope, 
     multihead_self_attention, 
     multihead_self_attention_with_rope,
-    linear,
-    embedding,
     swiglu,
     transformer_block,
-    transformer_lm
+    transformer_lm,
+    Embedding,
+    Linear
 )

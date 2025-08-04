@@ -49,14 +49,24 @@ def main():
     # num_heads = 12               # GPT-2 small heads (head_dim=64)
     # rope_theta = 10000
 
-    vocab_size = 32000
-    context_length = 1024        # Increased from 1024 - better for long-form generation
-    d_model = 768                # GPT-2 small hidden size
-    d_ff = 2048                  # 8/3 x d_model
-    num_layers = 8              # GPT-2 small depth
-    num_heads =  12              # GPT-2 small heads (head_dim=64)
-    rope_theta = 10000
+    # vocab_size = 32000
+    # context_length = 1024        # Increased from 1024 - better for long-form generation
+    # d_model = 768                # GPT-2 small hidden size
+    # d_ff = 2048                  # 8/3 x d_model
+    # num_layers = 8              # GPT-2 small depth
+    # num_heads =  12              # GPT-2 small heads (head_dim=64)
+    # rope_theta = 10000
  
+
+
+    vocab_size = 32000
+    context_length = 1024  
+    d_model = 768         
+    d_ff = 3072           
+    num_layers = 16       
+    num_heads =  12      
+    rope_theta = 10000
+
 
     context_length = args.context_length
     device = torch.device(args.device)
