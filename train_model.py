@@ -20,7 +20,7 @@ batch_size = 32
 num_steps = 50000
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-DATA_PATH = "data/TinyStoriesV2-GPT4-train.txt"
+DATA_PATH = "/Users/michaelli/Downloads/CS336_Assignment_1/data/TinyStoriesV2-GPT4-train.txt"
 SPECIAL_TOKEN = "<|endoftext|>"
 NUM_PROCESSES = 16  # Use 16 chunks for parallel pretokenization
 
@@ -67,14 +67,14 @@ def main():
     import time
     t0 = time.time()
     # Load BPE tokenizer
-    with open("tinystories_bpe_vocab.pkl", "rb") as f:
+    with open("/Users/michaelli/Downloads/CS336_Assignment_1/tinystories_bpe_vocab.pkl", "rb") as f:
         vocab = pickle.load(f)
-    with open("tinystories_bpe_merges.pkl", "rb") as f:
+    with open("/Users/michaelli/Downloads/CS336_Assignment_1/tinystories_bpe_merges.pkl", "rb") as f:
         merges = pickle.load(f)
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Loaded BPE tokenizer with vocab size: {len(vocab)} (elapsed: {time.time()-t0:.2f}s)")
     tokenizer = Tokenizer(vocab, merges, special_tokens=["<|endoftext|>"])
 
-    tokens_path = "tinystories_pretok_tokens.pkl"
+    tokens_path = "/Users/michaelli/Downloads/CS336_Assignment_1/tinystories_pretok_tokens.pkl"
     t1 = time.time()
     if os.path.exists(tokens_path):
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Loading pre-tokenized tokens from {tokens_path} (elapsed: {time.time()-t1:.2f}s)...")

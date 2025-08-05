@@ -128,11 +128,11 @@ def main():
     context_length = 1024  
     d_model = 768         
     d_ff = 3072           
-    num_layers = 12       
+    num_layers = 20       
     num_heads =  12      
     rope_theta = 10000
-    batch_size = 12   
-    num_steps = 100000     
+    batch_size = 8   
+    num_steps = 30000     
     accumulation_steps = 8    
     max_grad_norm = 1.0       # Gradient clipping threshold
 
@@ -154,11 +154,8 @@ def main():
     if rank == 0:
         print(f"Using device: {device}")
 
-    # Optimizer hyperparameters (must be defined before any optimizer usage)
-    # base_lr = 1e-4
-    # min_lr = 2e-5
-    base_lr = 5e-4   # was 1e-4
-    min_lr = 2e-5    # was 2e-5
+    base_lr = 5e-4
+    min_lr = 2e-5
 
     # Default scheduler parameters
     warmup_iters = int(0.05 * num_steps)
@@ -172,10 +169,6 @@ def main():
     # Model weights
     def init_weights():
         weights = {}
-        # Clear CUDA cache before initialization to reduce fragmentation
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        
         # Embedding: N(0, 1), truncated to [-3, 3]
         emb = torch.empty(vocab_size, d_model, device=device)
         torch.nn.init.trunc_normal_(emb, mean=0.0, std=1.0, a=-3.0, b=3.0)
@@ -209,11 +202,6 @@ def main():
         std_lm = (2.0 / (vocab_size + d_model)) ** 0.5
         torch.nn.init.trunc_normal_(lm_head, mean=0.0, std=std_lm, a=-3*std_lm, b=3*std_lm)
         weights["lm_head.weight"] = torch.nn.Parameter(lm_head, requires_grad=True)
-        
-        # Clear cache after weight initialization
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        
         return weights
 
     # Try to resume from checkpoint if using CUDA and checkpoint exists
@@ -276,13 +264,6 @@ def main():
     log("Starting training on OpenWebText...")
     log(f"Checkpoint will be saved to: {checkpoint_path}")
     log(f"Current best loss to beat: {best_loss:.4f}, best validation loss: {best_val_loss:.4f}")
-    
-    # Print memory usage
-    if device.type == "cuda":
-        allocated = torch.cuda.memory_allocated(device) / 1024**3
-        reserved = torch.cuda.memory_reserved(device) / 1024**3
-        log(f"GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
-    
     losses = []
     # best_loss is already initialized above during checkpoint loading
     use_amp = device.type == "cuda"

@@ -67,7 +67,7 @@ def main():
     parser = argparse.ArgumentParser(description='Generate text using a trained transformer language model')
     parser.add_argument('--prompt', type=str, required=True, help='Prompt text to start generation')
     parser.add_argument('--length', type=int, default=100, help='Maximum number of tokens to generate (default: 100)')
-    parser.add_argument('--checkpoint', type=str, default='/Users/michaelli/Downloads/openwebtext_transformer_ckpt.pt', 
+    parser.add_argument('--checkpoint', type=str, default='/Users/michaelli/openwebtext_transformer_ckpt.pt', 
                        help='Path to model checkpoint')
     parser.add_argument('--vocab', type=str, default='/Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_vocab.pkl',
                        help='Path to BPE vocabulary file')
@@ -158,6 +158,8 @@ def main():
     print(f"Starting generation with prompt: '{args.prompt}'")
     print(f"Temperature: {args.temperature}, Top-p: {args.top_p}")
     print("=" * 50)
+    print("\n=== STREAMED OUTPUT ===")
+    print(tokenizer.decode(prompt_ids), end="", flush=True)  # Print prompt first
 
     for step in range(args.length):
         # Prepare input - use only the most recent context_length tokens
@@ -198,9 +200,12 @@ def main():
         
         generated.append(next_token)
         
+        # Stream the new token
+        print(tokenizer.decode([next_token]), end="", flush=True)
+        
         # Stop if we hit end-of-text token
         if eos_token_id is not None and next_token == eos_token_id:
-            print(f"Generation stopped at step {step+1}: <|endoftext|> token generated")
+            print(f"\nGeneration stopped at step {step+1}: <|endoftext|> token generated")
             break
 
     # Decode and print results

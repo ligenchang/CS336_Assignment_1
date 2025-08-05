@@ -43,8 +43,8 @@ def main():
     batch_size = 32
     num_steps = 50000
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    tokens_path = "tinystories_pretok_tokens.pkl"
-    checkpoint_path = "tinystories_transformer_ckpt.pt"
+    tokens_path = "/Users/michaelli/Documents/CS336_Assignment_1/tinystories_pretok_tokens.pkl"
+    checkpoint_path = "/Users/michaelli/Documents/CS336_Assignment_1/tinystories_transformer_ckpt.pt"
 
     # Load tokenized data (memory-mapped for large files)
     with open(tokens_path, "rb") as f:
