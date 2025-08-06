@@ -40,6 +40,11 @@ def checkpointed_transformer_lm(vocab_size, context_length, d_model, num_layers,
     embedding_module = Embedding(vocab_size, d_model, device=device)
     embedding_module.weight.data.copy_(weights["token_embeddings.weight"].to(device))
     x = embedding_module(in_indices)
+    # Visualization: print shape and sample embedding vectors
+    print("\n[Embedding Visualization in checkpointed_transformer_lm]")
+    print(f"Embedding output shape: {x.shape}")
+    print(f"First 2 tokens' embedding vectors (first 8 dims):\n{x[0,:2,:8].detach().cpu().numpy()}")
+    print("... (showing first 2 tokens of first batch, first 8 embedding dims)")
     
     # Process layers in checkpointed chunks
     for chunk_start in range(0, num_layers, checkpoint_every_n_layers):
@@ -107,6 +112,16 @@ def get_batch(tokens, batch_size, context_length, device, data_pointer):
     # Use torch.stack for better performance
     x = torch.stack([torch.from_numpy(seq) for seq in batch_x]).to(device, dtype=torch.long, non_blocking=True)
     y = torch.stack([torch.from_numpy(seq) for seq in batch_y]).to(device, dtype=torch.long, non_blocking=True)
+
+    # Visualization: print a summary and sample of the batch
+    if hasattr(get_batch, "show_example") and get_batch.show_example:
+        print("\n[Batch Visualization]")
+        print(f"Batch size: {batch_size}, Context length: {context_length}")
+        print(f"First input batch (x[0]): {batch_x[0][:min(20, context_length)]}")
+        print(f"First target batch (y[0]): {batch_y[0][:min(20, context_length)]}")
+        print(f"x shape: {x.shape}, y shape: {y.shape}")
+        print("... (showing first 20 tokens of first batch)")
+        get_batch.show_example = False  # Only show once per run
     return x, y, data_pointer
 
 
@@ -152,6 +167,8 @@ def validate_model(weights, tokens, batch_size, context_length, device, vocab_si
 def save_checkpoint(weights, optimizer, iteration, best_loss, best_val_loss, out):
     # ...existing code...
     if dist.is_initialized() and dist.get_rank() != 0:
+                # Visualization: print output shape after each layer
+        print(f"Layer {i}: output shape {x_chunk.shape}")
         return
     checkpoint = {
         'weights': {k: v.detach().cpu() for k, v in weights.items()},
@@ -563,16 +580,37 @@ def train_loop(config):
         best_val_loss = initial_val_loss
         log(f"Initial validation loss: {initial_val_loss:.4f}")
     
+    # Enable batch visualization for the first batch
+    get_batch.show_example = True
+
     # Main training loop
     for step in range(start_step, config['num_steps']):
         # Update learning rate
         for param_group in optimizer.param_groups:
             param_group["lr"] = get_lr_cosine_schedule(
                 step, config['base_lr'], config['min_lr'], warmup_iters, cosine_cycle_iters)
-        
+
         # Get batch
         x, y, data_pointer = get_batch(tokens, config['batch_size'], config['context_length'], device, data_pointer)
-        
+
+        # Optionally visualize batch for every N steps (e.g., every 1000 steps)
+        if step % 1000 == 0 and step > 0:
+            print(f"\n[Step {step}] Batch Visualization:")
+            print(f"x[0][:20]: {x[0][:20].cpu().numpy()}")
+            print(f"y[0][:20]: {y[0][:20].cpu().numpy()}")
+            print(f"x shape: {x.shape}, y shape: {y.shape}")
+
+        # Visualize embedding for the first batch
+        if step == start_step:
+            # Get embedding weights
+            embedding_weight = weights["token_embeddings.weight"]
+            # Compute embedding output for first sequence in batch
+            x_embed = embedding_weight[x[0]].detach().cpu().numpy()  # shape: [context_length, d_model]
+            print("\n[Embedding Visualization]")
+            print(f"Embedding output shape for x[0]: {x_embed.shape}")
+            print(f"First 2 tokens' embedding vectors (truncated to first 8 dims):\n{x_embed[:2,:8]}")
+            print("... (showing first 2 tokens, first 8 embedding dims)")
+
         # Forward pass
         logits = forward_pass(config, weights, x, use_amp)
         
