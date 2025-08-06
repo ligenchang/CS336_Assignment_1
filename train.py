@@ -17,7 +17,7 @@ from cs336_basics.tokenizer import Tokenizer
 from cs336_basics.nn_utils import cross_entropy, TransformerLM
 from cs336_basics.optimizer import AdamW
 from cs336_basics.lr_scheduler import get_lr_cosine_schedule
-from cs336_basics.serialization import save_checkpoint, load_checkpoint
+from cs336_basics.serialization import save_checkpoint, load_checkpoint_enhanced, checkpoint_exists
 
 
 # =============================================================================
@@ -286,13 +286,20 @@ def setup_gpu_optimization():
         
         torch.cuda.empty_cache()
         # Enable memory fraction for better allocation
-        torch.cuda.set_per_process_memory_fraction(0.85)  # Reduced for safety
+        torch.cuda.set_per_process_memory_fraction(0.9)  # Increased for better utilization
+        
+        # Enable TF32 for better performance on Ampere GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         
         # Enable optimized attention for better performance
         torch.backends.cuda.enable_flash_sdp(True)
         
         # Enable tensor caching for better performance
         torch.backends.cudnn.benchmark = True
+        
+        # Optimize for training
+        torch.backends.cudnn.deterministic = False
         
         print(f"Initial GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f}GB")
         print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f}GB")
@@ -315,12 +322,19 @@ def load_checkpoint_simple(config, device):
     
     checkpoint_path = config['checkpoint_path']
     
-    # Try to load checkpoint if it exists
+    # Try to load checkpoint - handle both local and S3 paths using enhanced functions
     try:
-        if os.path.exists(checkpoint_path):
-            iteration = load_checkpoint(model, optimizer, checkpoint_path, device)
+        # Use checkpoint_exists for both S3 and local paths
+        print(f"Checking if checkpoint exists at: {checkpoint_path}")
+        if checkpoint_exists(checkpoint_path):
+            print(f"Checkpoint found! Loading from: {checkpoint_path}")
+            # Use load_checkpoint_enhanced which supports S3
+            # Correct parameter order: (src, model, optimizer, device)
+            iteration, metadata = load_checkpoint_enhanced(checkpoint_path, model, optimizer, device)
             start_step = iteration + 1
-            print(f"Resumed from checkpoint at step {start_step}")
+            # Extract best_loss from metadata if available
+            best_loss = metadata.get('best_loss', float('inf'))
+            print(f"Resumed from checkpoint at step {start_step} with best_loss {best_loss:.4f}")
         else:
             print(f"No checkpoint found at {checkpoint_path}. Starting from scratch.")
     except Exception as e:
@@ -378,10 +392,9 @@ def train_loop(config):
     data_pointer = 0
     use_amp = device.type == "cuda"
     
-    try:
-        scaler = torch.amp.GradScaler('cuda') if use_amp else None
-    except TypeError:
-        scaler = torch.amp.GradScaler() if use_amp else None
+    # Note: BFloat16 has a wide enough exponent range to avoid gradient underflow,
+    # so we don't need GradScaler (which is designed for float16)
+    # GradScaler can actually interfere with bfloat16 training
     
     # Scheduler parameters
     warmup_iters = int(0.05 * config['num_steps'])
@@ -442,13 +455,13 @@ def train_loop(config):
             # Save best model
             if avg_loss < best_loss:
                 best_loss = avg_loss
-                save_checkpoint(model, optimizer, step, config['checkpoint_path'])
+                save_checkpoint(model, optimizer, step, config['checkpoint_path'], best_loss=best_loss)
                 log(f"Best model saved at step {step + 1} with loss {best_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f} to {config['checkpoint_path']}")
             
             # Periodic checkpoint save every 2000 steps
             if (step + 1) % 2000 == 0:
                 periodic_checkpoint_path = config['checkpoint_path'].replace('.pt', f'_step_{step + 1}.pt')
-                save_checkpoint(model, optimizer, step, periodic_checkpoint_path)
+                save_checkpoint(model, optimizer, step, periodic_checkpoint_path, best_loss=best_loss)
                 log(f"Periodic checkpoint saved at step {step + 1} to {periodic_checkpoint_path}")
     
     # Save learning curve
