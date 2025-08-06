@@ -98,14 +98,14 @@ def get_dataset_defaults(dataset_name):
             'vocab_size': 32000,
             'context_length': 1024,
             'd_model': 768,
-            'd_ff': 3072,
-            'num_layers': 32,  # Reduced from 42 to fit A10 memory
+            'd_ff': 2048,
+            'num_layers': 24,
             'num_heads': 12,
-            'batch_size': 4,
-            'num_steps': 30000,
-            'accumulation_steps': 8,
-            'base_lr': 3e-4,
-            'min_lr': 1e-5,
+            'batch_size': 20,
+            'num_steps': 60000,
+            'accumulation_steps': 16,
+            'base_lr': 6e-4,
+            'min_lr': 6e-5,
             'max_grad_norm': 1.0,
             'rope_theta': 10000
         }
