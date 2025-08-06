@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import pickle
 from cs336_basics.tokenizer import Tokenizer
-from cs336_basics.nn_utils import transformer_lm
+from cs336_basics.nn_utils import TransformerLM
 #python generate_owt.py --prompt "Your prompt here" --length 100
 
 def softmax_with_temperature(logits, temperature=1.0):
@@ -80,7 +80,7 @@ def main():
 
     # Dataset-specific defaults - match train.py exactly
     if args.dataset == 'owt':
-        default_ckpt = '/Users/michaelli/openwebtext_transformer_ckpt_step_20000.pt'
+        default_ckpt = '/Users/michaelli/openwebtext_transformer_ckpt.pt'
         default_vocab = '/Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_vocab.pkl'
         default_merges = '/Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_merges.pkl'
         default_num_heads = 12  # From train.py OWT config
@@ -165,6 +165,21 @@ def main():
     print("[INFO] Inferred model parameters from checkpoint:")
     print(f"  vocab_size={vocab_size}, d_model={d_model}, d_ff={d_ff}, num_layers={num_layers}, num_heads={num_heads}, rope_theta={rope_theta}")
 
+    # Create model instance
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+        device=device,
+        dtype=torch.float32
+    )
+    model.load_state_dict(weights)
+    model.eval()  # Set to evaluation mode
+
     # Tokenize prompt
     prompt_ids = tokenizer.encode(args.prompt)
     print(f"Prompt tokens: {len(prompt_ids)}")
@@ -186,17 +201,7 @@ def main():
         
         # Forward pass through transformer
         with torch.no_grad():
-            logits = transformer_lm(
-                vocab_size=vocab_size,
-                context_length=context_length,
-                d_model=d_model,
-                num_layers=num_layers,
-                num_heads=num_heads,
-                d_ff=d_ff,
-                rope_theta=rope_theta,
-                weights=weights,
-                in_indices=x
-            )
+            logits = model(x)
         
         # Get logits for the last position (next token prediction)
         next_token_logits = logits[0, len(input_ids)-1].float()

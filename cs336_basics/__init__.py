@@ -5,7 +5,16 @@ import importlib.metadata
 from .tokenizer import Tokenizer
 from .train_bpe import train_bpe
 from .data import get_batch
-from .serialization import save_checkpoint, load_checkpoint, AdamW
+from .serialization import (
+    save_checkpoint, 
+    load_checkpoint, 
+    load_checkpoint_enhanced,
+    AdamW,
+    create_training_checkpoint,
+    load_training_checkpoint,
+    safe_load_checkpoint,
+    checkpoint_exists
+)
 from .optimizer import get_lr_cosine_schedule
 from .nn_utils import (
     softmax, 
@@ -19,7 +28,7 @@ from .nn_utils import (
     multihead_self_attention_with_rope,
     swiglu,
     transformer_block,
-    transformer_lm,
+    TransformerLM,
     Embedding,
     Linear
 )

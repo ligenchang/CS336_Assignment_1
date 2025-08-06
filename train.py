@@ -1,10 +1,8 @@
-
-
 """
 Transformer Language Model Training Script
 
 This script provides a robust training pipeline for transformer language models
-with support for gradient checkpointing, distributed training, and multiple datasets.
+with support for gradient checkpointing and multiple datasets.
 """
 
 import os
@@ -14,39 +12,30 @@ import argparse
 import torch
 import numpy as np
 import pickle
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 from cs336_basics.tokenizer import Tokenizer
-from cs336_basics.nn_utils import transformer_lm, cross_entropy
+from cs336_basics.nn_utils import cross_entropy, TransformerLM
 from cs336_basics.optimizer import AdamW
 from cs336_basics.lr_scheduler import get_lr_cosine_schedule
+from cs336_basics.serialization import save_checkpoint, load_checkpoint
 
 
 # =============================================================================
 # MODEL DEFINITIONS
 # =============================================================================
 
-def checkpointed_transformer_lm(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, rope_theta, weights, in_indices, checkpoint_every_n_layers=4):
+def checkpointed_transformer_lm(model, in_indices, checkpoint_every_n_layers=4):
     """
     Memory-efficient transformer with gradient checkpointing.
     Checkpoints every N layers to trade compute for memory.
     """
-    from cs336_basics.nn_utils import Embedding, RMSNorm, transformer_block
-    
     device = in_indices.device
     
     # Embedding (not checkpointed - minimal memory)
-    embedding_module = Embedding(vocab_size, d_model, device=device)
-    embedding_module.weight.data.copy_(weights["token_embeddings.weight"].to(device))
-    x = embedding_module(in_indices)
-    # Visualization: print shape and sample embedding vectors
-    print("\n[Embedding Visualization in checkpointed_transformer_lm]")
-    print(f"Embedding output shape: {x.shape}")
-    print(f"First 2 tokens' embedding vectors (first 8 dims):\n{x[0,:2,:8].detach().cpu().numpy()}")
-    print("... (showing first 2 tokens of first batch, first 8 embedding dims)")
+    x = model.token_embeddings(in_indices)
     
     # Process layers in checkpointed chunks
+    num_layers = len(model.layers)
     for chunk_start in range(0, num_layers, checkpoint_every_n_layers):
         chunk_end = min(chunk_start + checkpoint_every_n_layers, num_layers)
         
@@ -54,21 +43,7 @@ def checkpointed_transformer_lm(vocab_size, context_length, d_model, num_layers,
             """Process a chunk of transformer layers"""
             x_chunk = x_input
             for i in range(start_idx, end_idx):
-                layer_prefix = f"layers.{i}."
-                layer_weights = {
-                    k.replace(layer_prefix, ""): v 
-                    for k, v in weights.items() 
-                    if k.startswith(layer_prefix)
-                }
-                x_chunk = transformer_block(
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    d_ff=d_ff,
-                    max_seq_len=context_length,
-                    theta=rope_theta,
-                    weights=layer_weights,
-                    in_features=x_chunk
-                )
+                x_chunk = model.layers[i](x_chunk)
             return x_chunk
         
         # Apply gradient checkpointing to this chunk
@@ -80,15 +55,9 @@ def checkpointed_transformer_lm(vocab_size, context_length, d_model, num_layers,
             use_reentrant=False
         )
     
-    # Final layer norm (not checkpointed - minimal memory)
-    ln_final_weight = weights["ln_final.weight"]
-    ln_final = RMSNorm(d_model, 1e-5, device=device, dtype=x.dtype)
-    ln_final.weight.data.copy_(ln_final_weight)
-    x = ln_final(x)
-    
-    # Language model head (not checkpointed - minimal memory)
-    lm_head_weight = weights["lm_head.weight"]
-    logits = torch.matmul(x, lm_head_weight.transpose(0, 1))
+    # Final layer norm and LM head (not checkpointed - minimal memory)
+    x = model.ln_final(x)
+    logits = model.lm_head(x)
     
     return logits
 
@@ -112,83 +81,7 @@ def get_batch(tokens, batch_size, context_length, device, data_pointer):
     # Use torch.stack for better performance
     x = torch.stack([torch.from_numpy(seq) for seq in batch_x]).to(device, dtype=torch.long, non_blocking=True)
     y = torch.stack([torch.from_numpy(seq) for seq in batch_y]).to(device, dtype=torch.long, non_blocking=True)
-
-    # Visualization: print a summary and sample of the batch
-    if hasattr(get_batch, "show_example") and get_batch.show_example:
-        print("\n[Batch Visualization]")
-        print(f"Batch size: {batch_size}, Context length: {context_length}")
-        print(f"First input batch (x[0]): {batch_x[0][:min(20, context_length)]}")
-        print(f"First target batch (y[0]): {batch_y[0][:min(20, context_length)]}")
-        print(f"x shape: {x.shape}, y shape: {y.shape}")
-        print("... (showing first 20 tokens of first batch)")
-        get_batch.show_example = False  # Only show once per run
     return x, y, data_pointer
-
-
-# =============================================================================
-# MODEL VALIDATION
-# =============================================================================
-
-def validate_model(weights, tokens, batch_size, context_length, device, vocab_size, d_model, num_layers, num_heads, d_ff, rope_theta, use_amp=True, num_batches=10):
-    # ...existing code...
-    total_loss, num_samples = 0.0, 0
-    val_start = int(0.9 * len(tokens))
-    val_tokens = tokens[val_start:]
-    if len(val_tokens) < context_length + 1:
-        val_tokens = tokens[-min(len(tokens)//10, 100000):]
-    with torch.no_grad():
-        for _ in range(num_batches):
-            idx = np.random.randint(0, len(val_tokens) - context_length - 1, size=(batch_size,))
-            x = np.stack([val_tokens[i:i+context_length] for i in idx])
-            y = np.stack([val_tokens[i+1:i+context_length+1] for i in idx])
-            x = torch.tensor(x, dtype=torch.long, device=device)
-            y = torch.tensor(y, dtype=torch.long, device=device)
-            if use_amp:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    logits = transformer_lm(
-                        vocab_size=vocab_size, context_length=context_length, d_model=d_model, num_layers=num_layers,
-                        num_heads=num_heads, d_ff=d_ff, rope_theta=rope_theta, weights=weights, in_indices=x)
-                    logits = logits.float()
-                    loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-            else:
-                logits = transformer_lm(
-                    vocab_size=vocab_size, context_length=context_length, d_model=d_model, num_layers=num_layers,
-                    num_heads=num_heads, d_ff=d_ff, rope_theta=rope_theta, weights=weights, in_indices=x)
-                loss = cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-            total_loss += loss.item()
-            num_samples += 1
-    return total_loss / num_samples if num_samples > 0 else float('inf')
-
-
-# =============================================================================
-# CHECKPOINT MANAGEMENT
-# =============================================================================
-
-def save_checkpoint(weights, optimizer, iteration, best_loss, best_val_loss, out):
-    # ...existing code...
-    if dist.is_initialized() and dist.get_rank() != 0:
-                # Visualization: print output shape after each layer
-        print(f"Layer {i}: output shape {x_chunk.shape}")
-        return
-    checkpoint = {
-        'weights': {k: v.detach().cpu() for k, v in weights.items()},
-        'optimizer': optimizer.state_dict(),
-        'iteration': iteration,
-        'best_loss': best_loss,
-        'best_val_loss': best_val_loss
-    }
-    if out.startswith('s3://'):
-        try:
-            import boto3
-            bucket, key = out[5:].split('/', 1)
-            buffer = io.BytesIO()
-            torch.save(checkpoint, buffer)
-            buffer.seek(0)
-            boto3.client('s3').upload_fileobj(buffer, bucket, key)
-        except Exception as e:
-            print(f"S3 checkpoint save failed: {e}")
-    else:
-        torch.save(checkpoint, out)
 
 
 # =============================================================================
@@ -305,35 +198,36 @@ def parse_args_and_config():
 
 
 # =============================================================================
-# DEVICE AND DISTRIBUTED SETUP
+# DEVICE SETUP
 # =============================================================================
 
-# =============================================================================
-# DEVICE AND DISTRIBUTED SETUP
-# =============================================================================
-
-def setup_device_and_ddp():
-    """Setup device and distributed data parallel if available."""
-    ddp = False
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        dist.init_process_group(backend='nccl')
-        local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        torch.cuda.set_device(local_rank)
-        device = torch.device('cuda', local_rank)
-        ddp = True
-        rank = dist.get_rank()
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
-        rank = 0
-    return device, ddp, rank
+def setup_device():
+    """Setup device for training."""
+    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    return device
 
 
 # =============================================================================
 # MODEL INITIALIZATION
 # =============================================================================
 
+def init_model(vocab_size, d_model, num_layers, num_heads, d_ff, context_length, rope_theta, device):
+    """Initialize model using the optimized TransformerLM class."""
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+        device=device,
+        dtype=torch.float32
+    )
+    return model
+
 def init_weights_fn(vocab_size, d_model, num_layers, d_ff, device):
-    """Initialize model weights with proper scaling."""
+    """Initialize model weights with proper scaling (legacy function for compatibility)."""
     weights = {}
     
     # Token embeddings
@@ -404,120 +298,59 @@ def setup_gpu_optimization():
         print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f}GB")
 
 
-def setup_distributed_weights(weights, device):
-    """Setup weights for distributed training."""
-    class WeightsModule(torch.nn.Module):
-        def __init__(self, weights):
-            super().__init__()
-            for k, v in weights.items():
-                self.register_parameter(k.replace('.', '_'), v)
-        
-        def forward(self, *args, **kwargs):
-            raise NotImplementedError()
-    
-    weights_module = WeightsModule(weights)
-    weights_module = weights_module.to(device)
-    ddp_weights = DDP(weights_module, device_ids=[int(os.environ.get('LOCAL_RANK', 0))])
-    weights = {k: getattr(ddp_weights.module, k.replace('.', '_')) for k in weights.keys()}
-    return weights
-
-
 # =============================================================================
 # TRAINING LOOP
 # =============================================================================
 
-def load_checkpoint(config, device):
-    """Load checkpoint if it exists."""
-    weights = None
-    optimizer = None
+def load_checkpoint_simple(config, device):
+    """Simple checkpoint loading using basic serialization."""
+    # Always initialize model and optimizer from scratch
+    model = init_model(config['vocab_size'], config['d_model'], config['num_layers'], 
+                     config['num_heads'], config['d_ff'], config['context_length'], 
+                     config['rope_theta'], device)
+    optimizer = AdamW(model.parameters(), lr=config['base_lr'], betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
+    
     start_step = 0
     best_loss = float('inf')
-    best_val_loss = float('inf')
     
     checkpoint_path = config['checkpoint_path']
     
-    # Try S3 checkpoint first if path starts with s3://
-    if device.type == "cuda" and checkpoint_path.startswith("s3://"):
-        try:
-            import boto3
-            bucket, key = checkpoint_path[5:].split('/', 1)
-            s3 = boto3.client('s3')
-            buffer = io.BytesIO()
-            s3.download_fileobj(bucket, key, buffer)
-            buffer.seek(0)
-            checkpoint = torch.load(buffer, map_location=device)
-            weights = {k: v.to(device).clone().detach().requires_grad_(True) for k, v in checkpoint['weights'].items()}
-            optimizer = AdamW(weights.values(), lr=config['base_lr'], betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            start_step = checkpoint.get('iteration', 0) + 1
-            best_loss = checkpoint.get('best_loss', float('inf'))
-            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-            print(f"Resumed from S3 checkpoint at step {start_step} with best_loss {best_loss:.4f}, best_val_loss {best_val_loss:.4f}")
-        except Exception as e:
-            print(f"Could not load S3 checkpoint: {e}\nStarting from scratch.")
+    # Try to load checkpoint if it exists
+    try:
+        if os.path.exists(checkpoint_path):
+            iteration = load_checkpoint(model, optimizer, checkpoint_path, device)
+            start_step = iteration + 1
+            print(f"Resumed from checkpoint at step {start_step}")
+        else:
+            print(f"No checkpoint found at {checkpoint_path}. Starting from scratch.")
+    except Exception as e:
+        print(f"Could not load checkpoint from {checkpoint_path}: {e}\nStarting from scratch.")
     
-    # Try local checkpoint
-    elif os.path.exists(checkpoint_path):
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            weights = {k: v.to(device).clone().detach().requires_grad_(True) for k, v in checkpoint['weights'].items()}
-            optimizer = AdamW(weights.values(), lr=config['base_lr'], betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            start_step = checkpoint.get('iteration', 0) + 1
-            best_loss = checkpoint.get('best_loss', float('inf'))
-            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-            print(f"Resumed from local checkpoint at step {start_step} with best_loss {best_loss:.4f}, best_val_loss {best_val_loss:.4f}")
-        except Exception as e:
-            print(f"Could not load local checkpoint: {e}\nStarting from scratch.")
-    
-    # Initialize from scratch if no checkpoint found
-    if weights is None:
-        weights = init_weights_fn(config['vocab_size'], config['d_model'], config['num_layers'], config['d_ff'], device)
-        optimizer = AdamW(weights.values(), lr=config['base_lr'], betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
-    
-    return weights, optimizer, start_step, best_loss, best_val_loss
+    return model, optimizer, start_step, best_loss
 
 
-def forward_pass(config, weights, x, use_amp):
+def forward_pass(config, model, x, use_amp):
     """Perform forward pass with optional gradient checkpointing."""
     if config['use_gradient_checkpointing']:
         # Use layer-wise gradient checkpointing for memory efficiency
         if use_amp:
-            for param in weights.values():
-                param.data = param.data.float()
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 logits = checkpointed_transformer_lm(
-                    vocab_size=config['vocab_size'], context_length=config['context_length'], 
-                    d_model=config['d_model'], num_layers=config['num_layers'], 
-                    num_heads=config['num_heads'], d_ff=config['d_ff'],
-                    rope_theta=config['rope_theta'], weights=weights, in_indices=x, 
+                    model=model, in_indices=x, 
                     checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
                 logits = logits.float()
         else:
             logits = checkpointed_transformer_lm(
-                vocab_size=config['vocab_size'], context_length=config['context_length'], 
-                d_model=config['d_model'], num_layers=config['num_layers'], 
-                num_heads=config['num_heads'], d_ff=config['d_ff'],
-                rope_theta=config['rope_theta'], weights=weights, in_indices=x, 
+                model=model, in_indices=x, 
                 checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
     else:
         # Standard forward pass
         if use_amp:
-            for param in weights.values():
-                param.data = param.data.float()
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                logits = transformer_lm(
-                    vocab_size=config['vocab_size'], context_length=config['context_length'], 
-                    d_model=config['d_model'], num_layers=config['num_layers'], 
-                    num_heads=config['num_heads'], d_ff=config['d_ff'],
-                    rope_theta=config['rope_theta'], weights=weights, in_indices=x)
+                logits = model(x)
                 logits = logits.float()
         else:
-            logits = transformer_lm(
-                vocab_size=config['vocab_size'], context_length=config['context_length'], 
-                d_model=config['d_model'], num_layers=config['num_layers'], 
-                num_heads=config['num_heads'], d_ff=config['d_ff'],
-                rope_theta=config['rope_theta'], weights=weights, in_indices=x)
+            logits = model(x)
     
     return logits
 
@@ -525,24 +358,20 @@ def forward_pass(config, weights, x, use_amp):
 def train_loop(config):
     """Main training loop."""
     # Setup environment
-    device, ddp, rank = setup_device_and_ddp()
-    if rank == 0:
-        print(f"Using device: {device}")
-    
+    device = setup_device()
+    print(f"Using device: {device}")
+
     setup_gpu_optimization()
-    
+
     # Load data
     with open(config['tokens_path'], "rb") as f:
         tokens = pickle.load(f)
     tokens = np.array(tokens, dtype=np.int32)
-    
+
     # Load or initialize model
-    weights, optimizer, start_step, best_loss, best_val_loss = load_checkpoint(config, device)
-    
-    # Setup distributed training if needed
-    if ddp:
-        weights = setup_distributed_weights(weights, device)
-    
+    model, optimizer, start_step, best_loss = load_checkpoint_simple(config, device)
+    model = model.to(device)
+
     # Training setup
     optimizer.zero_grad()
     accum_loss = 0.0
@@ -565,54 +394,22 @@ def train_loop(config):
     log("Starting training...")
     log(f"Training configuration: steps {start_step} to {config['num_steps']} (total: {config['num_steps'] - start_step} remaining)")
     log(f"Gradient checkpointing: {'enabled (every ' + str(config['checkpoint_every_n_layers']) + ' layers)' if config['use_gradient_checkpointing'] else 'disabled'}")
-    log(f"Checkpoint will be saved to: {config['checkpoint_path']}")
-    log(f"Current best loss to beat: {best_loss:.4f}, best validation loss: {best_val_loss:.4f}")
+    log(f"Current best loss to beat: {best_loss:.4f}")
     
     losses = []
     
-    # Compute initial validation loss if needed
-    if best_val_loss == float('inf') and start_step > 0:
-        log("Computing initial validation loss for resumed checkpoint...")
-        initial_val_loss = validate_model(
-            weights, tokens, config['batch_size'], config['context_length'], device,
-            config['vocab_size'], config['d_model'], config['num_layers'], config['num_heads'],
-            config['d_ff'], config['rope_theta'], use_amp)
-        best_val_loss = initial_val_loss
-        log(f"Initial validation loss: {initial_val_loss:.4f}")
-    
-    # Enable batch visualization for the first batch
-    get_batch.show_example = True
-
     # Main training loop
     for step in range(start_step, config['num_steps']):
         # Update learning rate
         for param_group in optimizer.param_groups:
             param_group["lr"] = get_lr_cosine_schedule(
                 step, config['base_lr'], config['min_lr'], warmup_iters, cosine_cycle_iters)
-
+        
         # Get batch
         x, y, data_pointer = get_batch(tokens, config['batch_size'], config['context_length'], device, data_pointer)
-
-        # Optionally visualize batch for every N steps (e.g., every 1000 steps)
-        if step % 1000 == 0 and step > 0:
-            print(f"\n[Step {step}] Batch Visualization:")
-            print(f"x[0][:20]: {x[0][:20].cpu().numpy()}")
-            print(f"y[0][:20]: {y[0][:20].cpu().numpy()}")
-            print(f"x shape: {x.shape}, y shape: {y.shape}")
-
-        # Visualize embedding for the first batch
-        if step == start_step:
-            # Get embedding weights
-            embedding_weight = weights["token_embeddings.weight"]
-            # Compute embedding output for first sequence in batch
-            x_embed = embedding_weight[x[0]].detach().cpu().numpy()  # shape: [context_length, d_model]
-            print("\n[Embedding Visualization]")
-            print(f"Embedding output shape for x[0]: {x_embed.shape}")
-            print(f"First 2 tokens' embedding vectors (truncated to first 8 dims):\n{x_embed[:2,:8]}")
-            print("... (showing first 2 tokens, first 8 embedding dims)")
-
+        
         # Forward pass
-        logits = forward_pass(config, weights, x, use_amp)
+        logits = forward_pass(config, model, x, use_amp)
         
         # Compute loss
         loss = cross_entropy(logits.view(-1, config['vocab_size']), y.view(-1))
@@ -629,61 +426,30 @@ def train_loop(config):
         
         # Gradient update
         if (step + 1) % config['accumulation_steps'] == 0:
-            # Ensure gradients are in float32
-            for param in weights.values():
-                if param.grad is not None:
-                    param.grad.data = param.grad.data.float()
-            
             # Gradient clipping and optimization step
-            grad_norm = torch.nn.utils.clip_grad_norm_(weights.values(), config['max_grad_norm'])
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config['max_grad_norm'])
             optimizer.step()
             optimizer.zero_grad()
             
             avg_loss = accum_loss
             losses.append(avg_loss)
             
-            # Validation
-            val_loss = None
-            if (step + 1) % 500 == 0:
-                val_loss = validate_model(
-                    weights, tokens, config['batch_size'], config['context_length'], device,
-                    config['vocab_size'], config['d_model'], config['num_layers'], config['num_heads'],
-                    config['d_ff'], config['rope_theta'], use_amp)
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-            
             # Logging
             if (step + 1) % 100 == 0:
-                val_info = f", val_loss={val_loss:.4f}" if val_loss is not None else ""
                 mem_info = f", GPU_mem={torch.cuda.memory_allocated() / 1024**3:.1f}GB" if torch.cuda.is_available() else ""
-                log(f"Step {step + 1}: loss={avg_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f}, grad_norm={grad_norm:.4f}{val_info}{mem_info}")
+                log(f"Step {step + 1}: loss={avg_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f}, grad_norm={grad_norm:.4f}{mem_info}")
             
             # Save best model
             if avg_loss < best_loss:
                 best_loss = avg_loss
-                save_checkpoint(weights, optimizer, step, best_loss, best_val_loss, config['checkpoint_path'])
+                save_checkpoint(model, optimizer, step, config['checkpoint_path'])
                 log(f"Best model saved at step {step + 1} with loss {best_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f} to {config['checkpoint_path']}")
-            elif val_loss is not None and val_loss < best_val_loss:
-                best_val_loss = val_loss
-                val_checkpoint_path = config['checkpoint_path'].replace('.pt', '_best_val.pt')
-                save_checkpoint(weights, optimizer, step, best_loss, best_val_loss, val_checkpoint_path)
-                log(f"Best validation model saved at step {step + 1} with val_loss {best_val_loss:.4f} to {val_checkpoint_path}")
             
             # Periodic checkpoint save every 2000 steps
             if (step + 1) % 2000 == 0:
                 periodic_checkpoint_path = config['checkpoint_path'].replace('.pt', f'_step_{step + 1}.pt')
-                save_checkpoint(weights, optimizer, step, best_loss, best_val_loss, periodic_checkpoint_path)
+                save_checkpoint(model, optimizer, step, periodic_checkpoint_path)
                 log(f"Periodic checkpoint saved at step {step + 1} to {periodic_checkpoint_path}")
-                
-                # Keep only last 3 periodic checkpoints to save storage
-                if (step + 1) >= 6000:
-                    old_checkpoint = config['checkpoint_path'].replace('.pt', f'_step_{step + 1 - 6000}.pt')
-                    try:
-                        if not old_checkpoint.startswith('s3://') and os.path.exists(old_checkpoint):
-                            os.remove(old_checkpoint)
-                            log(f"Removed old periodic checkpoint: {old_checkpoint}")
-                    except Exception as e:
-                        log(f"Could not remove old checkpoint {old_checkpoint}: {e}")
     
     # Save learning curve
     np.save(config['curve_path'], np.array(losses))

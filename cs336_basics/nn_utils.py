@@ -235,6 +235,78 @@ class RMSNorm(torch.nn.Module):
         # Return the result in the original dtype
         return result.to(in_dtype)
 
+class MultiHeadSelfAttention(torch.nn.Module):
+    """
+    Multi-head self-attention module with pre-initialized Linear layers.
+    """
+    def __init__(self, d_model: int, num_heads: int, device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        
+        # Pre-initialize projection layers
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+    
+    def forward(self, in_features: Tensor, use_flash: bool = True) -> Tensor:
+        """
+        Forward pass for multi-head self-attention.
+        
+        Args:
+            in_features (Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+            use_flash (bool): Whether to use optimized attention implementation.
+            
+        Returns:
+            Tensor: Output tensor of shape (batch_size, seq_len, d_model).
+        """
+        batch_size, seq_len, _ = in_features.shape
+        
+        # Project inputs to queries, keys, and values
+        q = self.q_proj(in_features)
+        k = self.k_proj(in_features)
+        v = self.v_proj(in_features)
+        
+        # Reshape for multi-head attention: [batch_size, seq_len, d_model] -> [batch_size, num_heads, seq_len, head_dim]
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        if use_flash and hasattr(F, 'scaled_dot_product_attention'):
+            # Use PyTorch's optimized scaled_dot_product_attention with causal mask
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=True  # This handles the causal masking efficiently
+            )
+        else:
+            # Fallback to manual implementation
+            # Create causal mask to prevent attending to future tokens
+            # Shape: [seq_len, seq_len]
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=in_features.device)).bool()
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+            
+            # Apply scaled dot-product attention with causal mask
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = scores.masked_fill(~causal_mask, -1e9)  # Apply causal mask
+            
+            # Apply softmax to get attention weights
+            attn_weights = softmax(scores, dim=-1)
+            
+            # Apply attention weights to values
+            attn_output = torch.matmul(attn_weights, v)
+        
+        # Reshape back: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, d_model]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        
+        # Final linear projection
+        output = self.output_proj(attn_output)
+        
+        return output
+
 def multihead_self_attention(
     d_model: int,
     num_heads: int,
@@ -261,14 +333,14 @@ def multihead_self_attention(
     Returns:
         Tensor: Output tensor of shape (batch_size, seq_len, d_model).
     """
+    # Use direct einsum operations for better performance
     batch_size, seq_len, _ = in_features.shape
     head_dim = d_model // num_heads
     
-    # Project inputs to queries, keys, and values
-    # Using the projection weights as provided by the test
-    q = torch.matmul(in_features, q_proj_weight.t())
-    k = torch.matmul(in_features, k_proj_weight.t())
-    v = torch.matmul(in_features, v_proj_weight.t())
+    # Direct projections using einsum
+    q = einsum(in_features, q_proj_weight, '... d_in, d_out d_in -> ... d_out')
+    k = einsum(in_features, k_proj_weight, '... d_in, d_out d_in -> ... d_out')
+    v = einsum(in_features, v_proj_weight, '... d_in, d_out d_in -> ... d_out')
     
     # Reshape for multi-head attention: [batch_size, seq_len, d_model] -> [batch_size, num_heads, seq_len, head_dim]
     q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
@@ -303,10 +375,97 @@ def multihead_self_attention(
     # Reshape back: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, d_model]
     attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
     
-    # Final linear projection
-    output = torch.matmul(attn_output, o_proj_weight.t())
+    # Final linear projection using direct einsum
+    output = einsum(attn_output, o_proj_weight, '... d_in, d_out d_in -> ... d_out')
     
     return output
+
+class MultiHeadSelfAttentionWithRoPE(torch.nn.Module):
+    """
+    Multi-head self-attention module with RoPE and pre-initialized Linear layers.
+    """
+    def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float, device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.max_seq_len = max_seq_len
+        self.theta = theta
+        
+        # Pre-initialize projection layers
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        
+        # Pre-initialize RoPE module
+        self.rope_module = RotaryPositionalEmbedding(theta, self.head_dim, max_seq_len, device=device)
+    
+    def forward(self, in_features: Tensor, token_positions: Tensor = None, use_flash: bool = True) -> Tensor:
+        """
+        Forward pass for multi-head self-attention with RoPE.
+        
+        Args:
+            in_features (Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+            token_positions (Tensor): Tensor of token positions of shape (batch_size, seq_len).
+            use_flash (bool): Whether to use optimized attention implementation.
+            
+        Returns:
+            Tensor: Output tensor of shape (batch_size, seq_len, d_model).
+        """
+        batch_size, seq_len, _ = in_features.shape
+        device = in_features.device
+        
+        # Project inputs to queries, keys, and values
+        q = self.q_proj(in_features)
+        k = self.k_proj(in_features)
+        v = self.v_proj(in_features)
+        
+        # Reshape for multi-head attention: [batch_size, seq_len, d_model] -> [batch_size, num_heads, seq_len, head_dim]
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Handle token positions for RoPE
+        if token_positions is None:
+            token_positions = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        
+        # Apply RoPE to queries and keys for each head
+        for i in range(self.num_heads):
+            q[:, i] = self.rope_module(q[:, i], token_positions)
+            k[:, i] = self.rope_module(k[:, i], token_positions)
+        
+        if use_flash and hasattr(F, 'scaled_dot_product_attention'):
+            # Use PyTorch's optimized scaled_dot_product_attention with causal mask
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=True  # This handles the causal masking efficiently
+            )
+        else:
+            # Fallback to manual implementation
+            # Create causal mask to prevent attending to future tokens
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).bool()
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+            
+            # Apply scaled dot-product attention with causal mask
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = scores.masked_fill(~causal_mask, -1e9)  # Apply causal mask
+            
+            # Apply softmax to get attention weights
+            attn_weights = softmax(scores, dim=-1)
+            
+            # Apply attention weights to values
+            attn_output = torch.matmul(attn_weights, v)
+        
+        # Reshape back: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, d_model]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        
+        # Final linear projection
+        output = self.output_proj(attn_output)
+        
+        return output
 
 def multihead_self_attention_with_rope(
     d_model: int,
@@ -340,14 +499,15 @@ def multihead_self_attention_with_rope(
     Returns:
         Tensor: Output tensor of shape (batch_size, seq_len, d_model).
     """
+    # Use direct einsum operations for better performance
     batch_size, seq_len, _ = in_features.shape
     head_dim = d_model // num_heads
     device = in_features.device
     
-    # Project inputs to queries, keys, and values
-    q = torch.matmul(in_features, q_proj_weight.t())
-    k = torch.matmul(in_features, k_proj_weight.t())
-    v = torch.matmul(in_features, v_proj_weight.t())
+    # Direct projections using einsum
+    q = einsum(in_features, q_proj_weight, '... d_in, d_out d_in -> ... d_out')
+    k = einsum(in_features, k_proj_weight, '... d_in, d_out d_in -> ... d_out')
+    v = einsum(in_features, v_proj_weight, '... d_in, d_out d_in -> ... d_out')
     
     # Reshape for multi-head attention: [batch_size, seq_len, d_model] -> [batch_size, num_heads, seq_len, head_dim]
     q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
@@ -391,8 +551,8 @@ def multihead_self_attention_with_rope(
     # Reshape back: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, d_model]
     attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
     
-    # Final linear projection
-    output = torch.matmul(attn_output, o_proj_weight.t())
+    # Final linear projection using direct einsum
+    output = einsum(attn_output, o_proj_weight, '... d_in, d_out d_in -> ... d_out')
     
     return output
 
@@ -401,16 +561,16 @@ class Linear(torch.nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.W = torch.nn.Parameter(
+        self.weight = torch.nn.Parameter(
             torch.empty(out_features, in_features, device=device, dtype=dtype)
         )
         # Initialize with N(0, 2/(din+dout)), truncated to [-3σ, 3σ]
         std = (2.0 / (in_features + out_features)) ** 0.5
-        torch.nn.init.trunc_normal_(self.W, mean=0.0, std=std, a=-3*std, b=3*std)
+        torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=std, a=-3*std, b=3*std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Use einsum for batched linear transformation: (..., in_features), (out_features, in_features) -> (..., out_features)
-        return einsum(x, self.W, '... d_in, d_out d_in -> ... d_out')
+        return einsum(x, self.weight, '... d_in, d_out d_in -> ... d_out')
 
 
 class Embedding(torch.nn.Module):
@@ -428,6 +588,41 @@ class Embedding(torch.nn.Module):
         # Embedding lookup via advanced indexing (einsum doesn't support integer indexing)
         # The weight tensor will automatically be moved to the correct device during forward pass
         return self.weight[token_ids]
+
+class SwiGLU(torch.nn.Module):
+    """
+    SwiGLU activation function module with pre-initialized Linear layers.
+    """
+    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+        
+        # Pre-initialize Linear layers
+        self.w1 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(d_ff, d_model, device=device, dtype=dtype)
+        self.w3 = Linear(d_model, d_ff, device=device, dtype=dtype)
+    
+    def forward(self, in_features: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for SwiGLU.
+        
+        Args:
+            in_features (torch.Tensor): The input tensor of shape (..., d_model).
+            
+        Returns:
+            torch.Tensor: The output tensor of shape (..., d_model).
+        """
+        # First projections: W1x and W3x
+        w1x = self.w1(in_features)
+        w3x = self.w3(in_features)
+        
+        # Apply SiLU activation to W1x and element-wise multiply with W3x
+        silu_w1x = silu(w1x)
+        gated = silu_w1x * w3x
+        
+        # Final projection: W2(SiLU(W1x) ⊙ W3x)
+        return self.w2(gated)
 
 def swiglu(
     d_model: int,
@@ -454,16 +649,68 @@ def swiglu(
     Returns:
         torch.Tensor: The output tensor of shape (..., d_model).
     """
-    # First projections: W1x and W3x
-    w1x = einsum(in_features, w1_weight, '... d_model, d_ff d_model -> ... d_ff')
-    w3x = einsum(in_features, w3_weight, '... d_model, d_ff d_model -> ... d_ff')
+    # Direct projections using einsum for better performance
+    w1x = einsum(in_features, w1_weight, '... d_in, d_out d_in -> ... d_out')
+    w3x = einsum(in_features, w3_weight, '... d_in, d_out d_in -> ... d_out')
     
     # Apply SiLU activation to W1x and element-wise multiply with W3x
     silu_w1x = silu(w1x)
     gated = silu_w1x * w3x
     
     # Final projection: W2(SiLU(W1x) ⊙ W3x)
-    return einsum(gated, w2_weight, '... d_ff, d_model d_ff -> ... d_model')
+    return einsum(gated, w2_weight, '... d_in, d_out d_in -> ... d_out')
+
+class TransformerBlock(torch.nn.Module):
+    """
+    A single pre-norm transformer block with RoPE and pre-initialized modules.
+    """
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float, device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.max_seq_len = max_seq_len
+        self.theta = theta
+        
+        # Pre-initialize modules
+        self.ln1 = RMSNorm(d_model, 1e-5, device=device, dtype=dtype)
+        self.attn = MultiHeadSelfAttentionWithRoPE(d_model, num_heads, max_seq_len, theta, device=device, dtype=dtype)
+        self.ln2 = RMSNorm(d_model, 1e-5, device=device, dtype=dtype)
+        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+    
+    def forward(self, in_features: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for transformer block.
+        
+        Args:
+            in_features (torch.Tensor): The input tensor of shape (batch, seq_len, d_model).
+
+        Returns:
+            torch.Tensor: The output tensor of shape (batch, seq_len, d_model).
+        """
+        batch_size, seq_len, _ = in_features.shape
+        device = in_features.device
+        
+        # Generate positions for RoPE
+        positions = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        
+        # First LayerNorm (pre-norm architecture)
+        normed_features = self.ln1(in_features)
+        attn_output = self.attn(normed_features, token_positions=positions)
+        
+        # Residual connection
+        res1 = in_features + attn_output
+        
+        # Second LayerNorm (pre-norm for FFN)
+        normed_res1 = self.ln2(res1)
+        
+        # Feed-forward network with SwiGLU
+        ffn_output = self.ffn(normed_res1)
+        
+        # Final residual connection
+        output = res1 + ffn_output
+        
+        return output
 
 def transformer_block(
     d_model: int,
@@ -506,10 +753,11 @@ def transformer_block(
     device = in_features.device
     positions = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
     
-    # First LayerNorm (pre-norm architecture)
-    ln1 = RMSNorm(d_model, 1e-5, device=in_features.device, dtype=in_features.dtype)
-    ln1.weight.data.copy_(ln1_weight)
-    normed_features = ln1(in_features)
+    # First LayerNorm (pre-norm architecture) - use direct computation for performance
+    ln1_mean = torch.mean(in_features ** 2, dim=-1, keepdim=True)
+    ln1_rms = torch.sqrt(ln1_mean + 1e-5)
+    normed_features = (in_features / ln1_rms) * ln1_weight
+    
     attn_output = multihead_self_attention_with_rope(
         d_model=d_model,
         num_heads=num_heads,
@@ -526,10 +774,10 @@ def transformer_block(
     # Residual connection
     res1 = in_features + attn_output
     
-    # Second LayerNorm (pre-norm for FFN)
-    ln2 = RMSNorm(d_model, 1e-5, device=in_features.device, dtype=in_features.dtype)
-    ln2.weight.data.copy_(ln2_weight)
-    normed_res1 = ln2(res1)
+    # Second LayerNorm (pre-norm for FFN) - use direct computation for performance
+    ln2_mean = torch.mean(res1 ** 2, dim=-1, keepdim=True)
+    ln2_rms = torch.sqrt(ln2_mean + 1e-5)
+    normed_res1 = (res1 / ln2_rms) * ln2_weight
     
     # Feed-forward network with SwiGLU
     ffn_output = swiglu(
@@ -546,73 +794,51 @@ def transformer_block(
     
     return output
 
-def transformer_lm(
-    vocab_size: int,
-    context_length: int,
-    d_model: int,
-    num_layers: int,
-    num_heads: int,
-    d_ff: int,
-    rope_theta: float,
-    weights: dict,
-    in_indices: torch.Tensor
-) -> torch.Tensor:
+class TransformerLM(torch.nn.Module):
     """
-    Implements a transformer language model with RoPE.
-    
-    Args:
-        vocab_size (int): The size of the vocabulary.
-        context_length (int): The maximum context length.
-        d_model (int): The dimension of the model.
-        num_layers (int): The number of transformer layers.
-        num_heads (int): The number of attention heads.
-        d_ff (int): The dimension of the feed-forward layer.
-        rope_theta (float): The RoPE theta parameter.
-        weights (dict): A dictionary containing the weights for the transformer model.
-        in_indices (torch.Tensor): The input token indices of shape (batch_size, seq_len).
-        
-    Returns:
-        torch.Tensor: The output logits of shape (batch_size, seq_len, vocab_size).
+    A complete transformer language model with pre-initialized modules.
     """
-    batch_size, seq_len = in_indices.shape
-    device = in_indices.device
-    
-    # Embedding using the Embedding class
-    embedding_module = Embedding(vocab_size, d_model, device=device)
-    embedding_module.weight.data.copy_(weights["token_embeddings.weight"].to(device))
-    token_embeddings = embedding_module(in_indices)
-
-    
-    # Process through transformer layers
-    x = token_embeddings
-    for i in range(num_layers):
-        # Extract layer weights
-        layer_prefix = f"layers.{i}."
-        layer_weights = {
-            k.replace(layer_prefix, ""): v 
-            for k, v in weights.items() 
-            if k.startswith(layer_prefix)
-        }
+    def __init__(self, vocab_size: int, context_length: int, d_model: int, num_layers: int, 
+                 num_heads: int, d_ff: int, rope_theta: float, device=None, dtype=None):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
         
-        # Pass through transformer block
-        x = transformer_block(
-            d_model=d_model,
-            num_heads=num_heads,
-            d_ff=d_ff,
-            max_seq_len=context_length,
-            theta=rope_theta,
-            weights=layer_weights,
-            in_features=x
-        )
+        # Pre-initialize all modules
+        self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
+        self.layers = torch.nn.ModuleList([
+            TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta, device=device, dtype=dtype)
+            for _ in range(num_layers)
+        ])
+        self.ln_final = RMSNorm(d_model, 1e-5, device=device, dtype=dtype)
+        self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
     
-    # Final layer norm
-    ln_final_weight = weights["ln_final.weight"]
-    ln_final = RMSNorm(d_model, 1e-5, device=device, dtype=x.dtype)
-    ln_final.weight.data.copy_(ln_final_weight)
-    x = ln_final(x)
-    
-    # Language model head - project to vocabulary
-    lm_head_weight = weights["lm_head.weight"]
-    logits = torch.matmul(x, lm_head_weight.transpose(0, 1))
-    
-    return logits
+    def forward(self, in_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for transformer language model.
+        
+        Args:
+            in_indices (torch.Tensor): The input token indices of shape (batch_size, seq_len).
+            
+        Returns:
+            torch.Tensor: The output logits of shape (batch_size, seq_len, vocab_size).
+        """
+        # Embedding
+        x = self.token_embeddings(in_indices)
+        
+        # Process through transformer layers
+        for layer in self.layers:
+            x = layer(x)
+        
+        # Final layer norm
+        x = self.ln_final(x)
+        
+        # Language model head
+        logits = self.lm_head(x)
+        
+        return logits

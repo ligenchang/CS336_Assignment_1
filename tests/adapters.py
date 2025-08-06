@@ -35,7 +35,7 @@ def run_linear(
     linear_module = Linear(d_in, d_out, device=weights.device, dtype=weights.dtype)
     
     # Load the provided weights into the module
-    linear_module.load_state_dict({'W': weights})
+    linear_module.load_state_dict({'weight': weights})
     
     # Apply the transformation
     return linear_module(in_features)
@@ -391,11 +391,28 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    from cs336_basics import transformer_lm
-    return transformer_lm(
-        vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
-        rope_theta, weights, in_indices
+    from cs336_basics import TransformerLM
+    import torch
+    
+    # Create model instance
+    device = in_indices.device
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+        device=device,
+        dtype=in_indices.dtype if in_indices.dtype.is_floating_point else torch.float32
     )
+    
+    # Load weights into the model
+    model.load_state_dict(weights)
+    
+    # Run forward pass
+    return model(in_indices)
 
 
 def run_rmsnorm(
