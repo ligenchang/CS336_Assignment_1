@@ -56,3 +56,20 @@ python generate_owt.py --prompt "Once upon a time" --temperature 1.2 --top_p 0.9
 
 # Focused sampling (nucleus)
 python generate_owt.py --prompt "In machine learning" --temperature 0.8 --top_p 0.7 --length 200
+
+
+
+python train.py --dataset owt 
+python train.py --dataset tinystories 
+
+python generate_owt.py --dataset tinystories --prompt "Once upon a time"
+
+
+# Enable with default settings (checkpoint every 4 layers)
+python train.py --dataset owt --use_gradient_checkpointing
+
+# More aggressive memory savings (checkpoint every 2 layers)
+python train.py --dataset owt --use_gradient_checkpointing --checkpoint_every_n_layers 2
+
+# Less aggressive (checkpoint every 8 layers) 
+python train.py --dataset owt --use_gradient_checkpointing --checkpoint_every_n_layers 8

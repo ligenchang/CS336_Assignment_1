@@ -63,41 +63,54 @@ def load_checkpoint(path, device):
     weights = {k: v.to(device).clone().detach().requires_grad_(False) for k, v in checkpoint['weights'].items()}
     return weights
 
+
 def main():
     parser = argparse.ArgumentParser(description='Generate text using a trained transformer language model')
+    parser.add_argument('--dataset', type=str, default='owt', choices=['owt', 'tinystories'], help='Dataset: owt or tinystories')
     parser.add_argument('--prompt', type=str, required=True, help='Prompt text to start generation')
     parser.add_argument('--length', type=int, default=100, help='Maximum number of tokens to generate (default: 100)')
-    parser.add_argument('--checkpoint', type=str, default='/Users/michaelli/openwebtext_transformer_ckpt.pt', 
-                       help='Path to model checkpoint')
-    parser.add_argument('--vocab', type=str, default='/Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_vocab.pkl',
-                       help='Path to BPE vocabulary file')
-    parser.add_argument('--merges', type=str, default='/Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_merges.pkl',
-                       help='Path to BPE merges file')
-    parser.add_argument('--context_length', type=int, default=256, help='Context length for generation (default: 256)')
-    parser.add_argument('--device', type=str, default='mps' if torch.backends.mps.is_available() else 'cpu',
-                       help='Device to run on (default: auto-detect)')
-    parser.add_argument('--temperature', type=float, default=1.0, 
-                       help='Sampling temperature (0.0=greedy, >1.0=more random, default: 1.0)')
-    parser.add_argument('--top_p', type=float, default=1.0, 
-                       help='Top-p (nucleus) sampling threshold (0.0-1.0, default: 1.0=no filtering)')
+    parser.add_argument('--checkpoint', type=str, default=None, help='Path to model checkpoint (overrides dataset default)')
+    parser.add_argument('--vocab', type=str, default=None, help='Path to BPE vocabulary file (overrides dataset default)')
+    parser.add_argument('--merges', type=str, default=None, help='Path to BPE merges file (overrides dataset default)')
+    parser.add_argument('--context_length', type=int, default=None, help='Context length for generation (overrides dataset default)')
+    parser.add_argument('--device', type=str, default='mps' if torch.backends.mps.is_available() else 'cpu', help='Device to run on (default: auto-detect)')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (0.0=greedy, >1.0=more random, default: 1.0)')
+    parser.add_argument('--top_p', type=float, default=1.0, help='Top-p (nucleus) sampling threshold (0.0-1.0, default: 1.0=no filtering)')
     args = parser.parse_args()
-    
-    # Validate arguments
-    if args.temperature < 0:
-        raise ValueError("Temperature must be non-negative")
-    if not (0.0 <= args.top_p <= 1.0):
-        raise ValueError("Top-p must be between 0.0 and 1.0")
-    if args.length <= 0:
-        raise ValueError("Length must be positive")
+
+    # Dataset-specific defaults - match train.py exactly
+    if args.dataset == 'owt':
+        default_ckpt = '/Users/michaelli/openwebtext_transformer_ckpt.pt'
+        default_vocab = '/Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_vocab.pkl'
+        default_merges = '/Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_merges.pkl'
+        default_num_heads = 12  # From train.py OWT config
+        default_context_length = 1024  # From train.py OWT config
+    else:
+        default_ckpt = 'tinystories_transformer_ckpt.pt'
+        default_vocab = '/Users/michaelli/Downloads/CS336_Assignment_1/tinystories_bpe_vocab.pkl'
+        default_merges = '/Users/michaelli/Downloads/CS336_Assignment_1/tinystories_bpe_merges.pkl'
+        default_num_heads = 16  # From train.py TinyStories config
+        default_context_length = 256  # From train.py TinyStories config
 
 
-    def infer_model_params(weights):
-        # Infer vocab_size and d_model from embedding
+    checkpoint = args.checkpoint or default_ckpt
+    vocab = args.vocab or default_vocab
+    merges = args.merges or default_merges
+
+    # Load model weights early to allow context_length inference
+    device = torch.device(args.device)
+    weights = load_checkpoint(checkpoint, device)
+
+    def infer_model_params(weights, default_num_heads):
         emb = weights["token_embeddings.weight"]
         vocab_size, d_model = emb.shape
-        # Infer num_layers by counting unique layer prefixes
         layer_prefixes = set()
         d_ff = None
+        
+        # Use dataset-specific default for num_heads instead of trying to infer
+        num_heads = default_num_heads
+        print(f"[DEBUG] Using dataset-specific num_heads={num_heads} for d_model={d_model}")
+        
         for k in weights.keys():
             if k.startswith("layers."):
                 parts = k.split(".")
@@ -106,38 +119,43 @@ def main():
                 if d_ff is None and k.endswith("ffn.w1.weight"):
                     d_ff = weights[k].shape[0]
         num_layers = len(layer_prefixes)
-        # Try to infer num_heads (if possible)
-        # This is ambiguous unless you store it, but you can guess if q_proj.weight shape is [d_model, d_model]
-        # Assume head_dim = 64 (common for GPT-2 style)
-        head_dim = 64
-        num_heads = d_model // head_dim if d_model % head_dim == 0 else None
-        # rope_theta is usually fixed
         rope_theta = 10000
+        context_length = None
         return dict(
             vocab_size=vocab_size,
             d_model=d_model,
             d_ff=d_ff,
             num_layers=num_layers,
             num_heads=num_heads,
-            rope_theta=rope_theta
+            rope_theta=rope_theta,
+            context_length=context_length
         )
 
-    context_length = args.context_length
-    device = torch.device(args.device)
+    params = infer_model_params(weights, default_num_heads)
+    inferred_context_length = params.get('context_length', None)
+    context_length = args.context_length or inferred_context_length or default_context_length
+
+
+    # Validate arguments
+    if args.temperature < 0:
+        raise ValueError("Temperature must be non-negative")
+    if not (0.0 <= args.top_p <= 1.0):
+        raise ValueError("Top-p must be between 0.0 and 1.0")
+    if args.length <= 0:
+        raise ValueError("Length must be positive")
 
     # Load tokenizer
-    tokenizer = Tokenizer.from_files(args.vocab, args.merges)
-    
+    tokenizer = Tokenizer.from_files(vocab, merges)
+
     # Get end-of-text token ID for stopping
     eos_token_id = tokenizer.byte_to_id.get(b'<|endoftext|>', None)
     if eos_token_id is None:
         print("Warning: <|endoftext|> token not found in tokenizer. Generation may not stop properly.")
 
-
     # Load model weights
-    weights = load_checkpoint(args.checkpoint, device)
+    weights = load_checkpoint(checkpoint, device)
     # Infer model hyperparameters
-    params = infer_model_params(weights)
+    params = infer_model_params(weights, default_num_heads)
     vocab_size = params['vocab_size']
     d_model = params['d_model']
     d_ff = params['d_ff']
@@ -153,7 +171,7 @@ def main():
     if len(prompt_ids) > context_length:
         print(f"Warning: Prompt too long ({len(prompt_ids)} tokens), truncating to last {context_length} tokens")
         prompt_ids = prompt_ids[-context_length:]
-    
+
     generated = list(prompt_ids)
     print(f"Starting generation with prompt: '{args.prompt}'")
     print(f"Temperature: {args.temperature}, Top-p: {args.top_p}")
