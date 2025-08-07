@@ -107,15 +107,15 @@ def get_dataset_defaults(dataset_name):
             'curve_path': 'openwebtext_learning_curve.npy',
             'vocab_size': 32000,
             'context_length': 1024,
-            'd_model': 768,
-            'd_ff': 2048,
-            'num_layers': 24,
-            'num_heads': 12,
-            'batch_size': 20,
+            'd_model': 768,   # Back to original
+            'd_ff': 2048,     # Back to original
+            'num_layers': 24, # Back to original
+            'num_heads': 12,  # Back to original
+            'batch_size': 24, # Back to original
             'num_steps': 60000,
-            'accumulation_steps': 16,
-            'base_lr': 6e-4,
-            'min_lr': 6e-5,
+            'accumulation_steps': 16, # Back to original
+            'base_lr': 6e-4,  # Back to original
+            'min_lr': 6e-5,   # Back to original
             'max_grad_norm': 1.0,
             'rope_theta': 10000
         }
@@ -186,6 +186,8 @@ def parse_args_and_config():
     # Model optimization options
     parser.add_argument('--compile_model', action='store_true', 
                        help='Enable PyTorch model compilation for better performance')
+    parser.add_argument('--auto_batch_size', action='store_true', 
+                       help='Automatically find optimal batch size for available GPU memory')
     
     args = parser.parse_args()
     
@@ -214,7 +216,8 @@ def parse_args_and_config():
         'checkpoint_every_n_layers': args.checkpoint_every_n_layers,
         'profile': args.profile,
         'torch_profiler': args.torch_profiler,
-        'compile_model': args.compile_model
+        'compile_model': args.compile_model,
+        'auto_batch_size': args.auto_batch_size
     }
     
     return config
@@ -304,12 +307,12 @@ def init_weights_fn(vocab_size, d_model, num_layers, d_ff, device):
 def setup_gpu_optimization():
     """Configure GPU settings for optimal performance."""
     if torch.cuda.is_available():
-        # Set memory management environment variables
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+        # Set memory management environment variables for better memory utilization
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
         
         torch.cuda.empty_cache()
-        # Enable memory fraction for better allocation
-        torch.cuda.set_per_process_memory_fraction(0.9)  # Increased for better utilization
+        # Use more aggressive memory fraction to utilize available memory
+        torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of GPU memory
         
         # Enable TF32 for better performance on Ampere GPUs
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -326,6 +329,7 @@ def setup_gpu_optimization():
         
         print(f"Initial GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f}GB")
         print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f}GB")
+        print(f"Memory fraction set to: 95% = {torch.cuda.get_device_properties(0).total_memory * 0.95 / 1024**3:.2f}GB")
 
 
 def get_gpu_memory_info():
@@ -337,6 +341,57 @@ def get_gpu_memory_info():
         free = total - reserved
         return f"GPU: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved, {free:.1f}GB free"
     return "GPU: Not available"
+
+
+def find_optimal_batch_size(model, config, device, tokens):
+    """Find the largest batch size that fits in GPU memory."""
+    if not config.get('auto_batch_size', False):
+        return config['batch_size']
+    
+    print("Finding optimal batch size for available GPU memory...")
+    original_batch_size = config['batch_size']
+    
+    # Start with a small batch size and increase
+    test_batch_size = 4
+    max_batch_size = original_batch_size
+    
+    while test_batch_size <= 64:  # Reasonable upper limit
+        try:
+            torch.cuda.empty_cache()
+            
+            # Test forward and backward pass with this batch size
+            x = torch.randint(0, config['vocab_size'], (test_batch_size, config['context_length']), device=device)
+            y = torch.randint(0, config['vocab_size'], (test_batch_size, config['context_length']), device=device)
+            
+            # Forward pass
+            if config['use_gradient_checkpointing']:
+                logits = checkpointed_transformer_lm(
+                    model=model, in_indices=x, 
+                    checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
+            else:
+                logits = model(x)
+            
+            # Loss and backward pass
+            from cs336_basics.nn_utils import cross_entropy
+            loss = cross_entropy(logits.view(-1, config['vocab_size']), y.view(-1))
+            loss.backward()
+            model.zero_grad()
+            
+            # If we get here without OOM, this batch size works
+            max_batch_size = test_batch_size
+            print(f"Batch size {test_batch_size} fits in memory")
+            test_batch_size += 4
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"Batch size {test_batch_size} causes OOM, stopping at {max_batch_size}")
+                break
+            else:
+                raise e
+    
+    torch.cuda.empty_cache()
+    print(f"Optimal batch size found: {max_batch_size} (original: {original_batch_size})")
+    return max_batch_size
 
 
 # =============================================================================
@@ -500,6 +555,21 @@ def train_loop(config):
     # Load or initialize model
     model, optimizer, start_step, best_loss, data_pointer = load_checkpoint_simple(config, device)
     model = model.to(device)
+    
+    # Find optimal batch size if requested
+    if config.get('auto_batch_size', False):
+        optimal_batch_size = find_optimal_batch_size(model, config, device, tokens)
+        if optimal_batch_size != config['batch_size']:
+            # Adjust accumulation steps to maintain similar effective batch size
+            effective_batch_size = config['batch_size'] * config['accumulation_steps']
+            new_accumulation_steps = max(1, effective_batch_size // optimal_batch_size)
+            
+            print(f"Adjusting batch size from {config['batch_size']} to {optimal_batch_size}")
+            print(f"Adjusting accumulation steps from {config['accumulation_steps']} to {new_accumulation_steps}")
+            print(f"Effective batch size: {optimal_batch_size * new_accumulation_steps} (was {effective_batch_size})")
+            
+            config['batch_size'] = optimal_batch_size
+            config['accumulation_steps'] = new_accumulation_steps
     
     # Compile model if requested
     model = compile_model_if_requested(model, config)
