@@ -67,17 +67,27 @@ def checkpointed_transformer_lm(model, in_indices, checkpoint_every_n_layers=4):
 # =============================================================================
 
 def get_batch(tokens, batch_size, context_length, device, data_pointer):
-    # ...existing code...
     max_start = len(tokens) - context_length - 1
     batch_x, batch_y = [], []
+    
     for _ in range(batch_size):
+        # Check and wrap around BEFORE extracting data
         if data_pointer >= max_start:
             data_pointer = 0
+            
+        # Extract sequences
         x = tokens[data_pointer:data_pointer + context_length]
         y = tokens[data_pointer + 1:data_pointer + context_length + 1]
         batch_x.append(x)
         batch_y.append(y)
+        
+        # Advance pointer for next sample
         data_pointer += context_length
+        
+        # Additional safety check: if advancing puts us past the boundary, wrap around
+        if data_pointer >= max_start:
+            data_pointer = 0
+    
     # Use torch.stack for better performance
     x = torch.stack([torch.from_numpy(seq) for seq in batch_x]).to(device, dtype=torch.long, non_blocking=True)
     y = torch.stack([torch.from_numpy(seq) for seq in batch_y]).to(device, dtype=torch.long, non_blocking=True)
@@ -167,6 +177,16 @@ def parse_args_and_config():
     parser.add_argument('--checkpoint_every_n_layers', type=int, default=4, 
                        help='Checkpoint every N layers (lower = more memory savings, higher compute cost)')
     
+    # Profiling options
+    parser.add_argument('--profile', action='store_true', 
+                       help='Enable detailed timing profiling')
+    parser.add_argument('--torch_profiler', action='store_true', 
+                       help='Enable PyTorch profiler (saves to ./profiler_logs)')
+    
+    # Model optimization options
+    parser.add_argument('--compile_model', action='store_true', 
+                       help='Enable PyTorch model compilation for better performance')
+    
     args = parser.parse_args()
     
     # Get dataset defaults
@@ -191,7 +211,10 @@ def parse_args_and_config():
         'max_grad_norm': args.max_grad_norm or default['max_grad_norm'],
         'rope_theta': default['rope_theta'],
         'use_gradient_checkpointing': args.use_gradient_checkpointing,
-        'checkpoint_every_n_layers': args.checkpoint_every_n_layers
+        'checkpoint_every_n_layers': args.checkpoint_every_n_layers,
+        'profile': args.profile,
+        'torch_profiler': args.torch_profiler,
+        'compile_model': args.compile_model
     }
     
     return config
@@ -305,6 +328,17 @@ def setup_gpu_optimization():
         print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f}GB")
 
 
+def get_gpu_memory_info():
+    """Get current GPU memory usage info."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        free = total - reserved
+        return f"GPU: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved, {free:.1f}GB free"
+    return "GPU: Not available"
+
+
 # =============================================================================
 # TRAINING LOOP
 # =============================================================================
@@ -319,6 +353,7 @@ def load_checkpoint_simple(config, device):
     
     start_step = 0
     best_loss = float('inf')
+    data_pointer = 0  # Default data pointer
     
     checkpoint_path = config['checkpoint_path']
     
@@ -328,19 +363,99 @@ def load_checkpoint_simple(config, device):
         print(f"Checking if checkpoint exists at: {checkpoint_path}")
         if checkpoint_exists(checkpoint_path):
             print(f"Checkpoint found! Loading from: {checkpoint_path}")
-            # Use load_checkpoint_enhanced which supports S3
-            # Correct parameter order: (src, model, optimizer, device)
-            iteration, metadata = load_checkpoint_enhanced(checkpoint_path, model, optimizer, device)
-            start_step = iteration + 1
-            # Extract best_loss from metadata if available
-            best_loss = metadata.get('best_loss', float('inf'))
-            print(f"Resumed from checkpoint at step {start_step} with best_loss {best_loss:.4f}")
+            try:
+                # Try normal load first
+                iteration, metadata = load_checkpoint_enhanced(checkpoint_path, model, optimizer, device)
+                start_step = iteration + 1
+                best_loss = metadata.get('best_loss', float('inf'))
+                data_pointer = metadata.get('data_pointer', None)
+            except RuntimeError as e:
+                if "_orig_mod" in str(e):
+                    print("Checkpoint appears to be from a compiled model. Attempting to fix key names...")
+                    # Load the raw checkpoint data
+                    if checkpoint_path.startswith('s3://'):
+                        import boto3
+                        import io
+                        bucket, key = checkpoint_path.replace('s3://', '').split('/', 1)
+                        s3 = boto3.client('s3')
+                        buffer = io.BytesIO()
+                        s3.download_fileobj(bucket, key, buffer)
+                        buffer.seek(0)
+                        checkpoint_data = torch.load(buffer, map_location=device)
+                    else:
+                        checkpoint_data = torch.load(checkpoint_path, map_location=device)
+
+                    # Fix the state dict keys by removing _orig_mod prefix
+                    if 'model_state_dict' in checkpoint_data:
+                        fixed_state_dict = {}
+                        for key, value in checkpoint_data['model_state_dict'].items():
+                            if key.startswith('_orig_mod.'):
+                                new_key = key[len('_orig_mod.'):]
+                                fixed_state_dict[new_key] = value
+                            else:
+                                fixed_state_dict[key] = value
+                        model.load_state_dict(fixed_state_dict)
+                        if 'optimizer_state_dict' in checkpoint_data:
+                            optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
+                        iteration = checkpoint_data.get('iteration', 0)
+                        start_step = iteration + 1
+                        # Extract best_loss and data_pointer from top-level keys for compiled model
+                        best_loss = checkpoint_data.get('best_loss', float('inf'))
+                        data_pointer = checkpoint_data.get('data_pointer', None)
+                        print(f"Successfully loaded compiled model checkpoint with fixed keys")
+                    else:
+                        raise e
+                else:
+                    raise e
+
+            if data_pointer is None:
+                # Calculate data_pointer for legacy checkpoints
+                tokens_per_step = config['batch_size'] * config['context_length']
+                total_tokens_processed = iteration * tokens_per_step
+                with open(config['tokens_path'], "rb") as f:
+                    tokens = pickle.load(f)
+                total_tokens = len(tokens)
+                max_start = total_tokens - config['context_length'] - 1
+                data_pointer = total_tokens_processed % total_tokens
+                if data_pointer >= max_start:
+                    data_pointer = 0
+                tokens_per_epoch = total_tokens
+                current_epoch = total_tokens_processed // tokens_per_epoch
+                tokens_in_current_epoch = total_tokens_processed % tokens_per_epoch
+                epoch_progress = (tokens_in_current_epoch / tokens_per_epoch) * 100
+                print(f"Legacy checkpoint detected - calculated data_pointer: {data_pointer}")
+                print(f"  Total tokens processed: {total_tokens_processed:,}")
+                print(f"  Dataset size: {total_tokens:,} tokens")
+                print(f"  Tokens per step: {tokens_per_step}")
+                print(f"  Training epoch: {current_epoch + 1} (epoch {current_epoch + 1:.1f}, {epoch_progress:.1f}% through current epoch)")
+                print(f"  Epochs completed: {current_epoch}, tokens in current epoch: {tokens_in_current_epoch:,}")
+            print(f"Resumed from checkpoint at step {start_step} with best_loss {best_loss:.4f}, data_pointer {data_pointer}")
         else:
             print(f"No checkpoint found at {checkpoint_path}. Starting from scratch.")
     except Exception as e:
         print(f"Could not load checkpoint from {checkpoint_path}: {e}\nStarting from scratch.")
-    
-    return model, optimizer, start_step, best_loss
+    return model, optimizer, start_step, best_loss, data_pointer
+
+
+def compile_model_if_requested(model, config):
+    """Compile model if compilation is requested and supported."""
+    if config.get('compile_model', False):
+        if hasattr(torch, 'compile'):
+            print("Compiling model for optimized performance...")
+            try:
+                # Use default compilation mode for best balance of compilation time vs performance
+                compiled_model = torch.compile(model)
+                print("Model compilation successful!")
+                return compiled_model
+            except Exception as e:
+                print(f"Model compilation failed: {e}")
+                print("Continuing with uncompiled model...")
+                return model
+        else:
+            print("Model compilation requested but torch.compile not available (requires PyTorch 2.0+)")
+            print("Continuing with uncompiled model...")
+            return model
+    return model
 
 
 def forward_pass(config, model, x, use_amp):
@@ -383,13 +498,16 @@ def train_loop(config):
     tokens = np.array(tokens, dtype=np.int32)
 
     # Load or initialize model
-    model, optimizer, start_step, best_loss = load_checkpoint_simple(config, device)
+    model, optimizer, start_step, best_loss, data_pointer = load_checkpoint_simple(config, device)
     model = model.to(device)
+    
+    # Compile model if requested
+    model = compile_model_if_requested(model, config)
 
     # Training setup
     optimizer.zero_grad()
     accum_loss = 0.0
-    data_pointer = 0
+    # data_pointer is now loaded from checkpoint or initialized to 0
     use_amp = device.type == "cuda"
     
     # Note: BFloat16 has a wide enough exponent range to avoid gradient underflow,
@@ -407,31 +525,56 @@ def train_loop(config):
     log("Starting training...")
     log(f"Training configuration: steps {start_step} to {config['num_steps']} (total: {config['num_steps'] - start_step} remaining)")
     log(f"Gradient checkpointing: {'enabled (every ' + str(config['checkpoint_every_n_layers']) + ' layers)' if config['use_gradient_checkpointing'] else 'disabled'}")
+    log(f"Model compilation: {'enabled' if config.get('compile_model', False) else 'disabled'}")
     log(f"Current best loss to beat: {best_loss:.4f}")
     
     losses = []
     
+    # Profiling setup
+    if config['torch_profiler']:
+        profiler = torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
+        profiler.start()
+        log("PyTorch profiler enabled - traces will be saved to ./profiler_logs")
+    else:
+        profiler = None
+    
     # Main training loop
     for step in range(start_step, config['num_steps']):
+        step_start_time = time.time() if config['profile'] else None
+        
         # Update learning rate
         for param_group in optimizer.param_groups:
             param_group["lr"] = get_lr_cosine_schedule(
                 step, config['base_lr'], config['min_lr'], warmup_iters, cosine_cycle_iters)
         
         # Get batch
+        data_start_time = time.time() if config['profile'] else None
         x, y, data_pointer = get_batch(tokens, config['batch_size'], config['context_length'], device, data_pointer)
+        data_end_time = time.time() if config['profile'] else None
         
         # Forward pass
+        forward_start_time = time.time() if config['profile'] else None
         logits = forward_pass(config, model, x, use_amp)
+        forward_end_time = time.time() if config['profile'] else None
         
         # Compute loss
+        loss_start_time = time.time() if config['profile'] else None
         loss = cross_entropy(logits.view(-1, config['vocab_size']), y.view(-1))
         z_loss = 1e-4 * torch.mean(torch.logsumexp(logits, dim=-1))
         loss = loss + z_loss
         loss = loss / config['accumulation_steps']
+        loss_end_time = time.time() if config['profile'] else None
         
         # Backward pass
+        backward_start_time = time.time() if config['profile'] else None
         loss.backward()
+        backward_end_time = time.time() if config['profile'] else None
         
         if step % config['accumulation_steps'] == 0:
             accum_loss = 0.0
@@ -440,29 +583,63 @@ def train_loop(config):
         # Gradient update
         if (step + 1) % config['accumulation_steps'] == 0:
             # Gradient clipping and optimization step
+            optimizer_start_time = time.time() if config['profile'] else None
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config['max_grad_norm'])
             optimizer.step()
             optimizer.zero_grad()
+            optimizer_end_time = time.time() if config['profile'] else None
             
             avg_loss = accum_loss
             losses.append(avg_loss)
             
+            # Detailed timing info
+            if config['profile'] and step_start_time is not None:
+                step_total_time = time.time() - step_start_time
+                data_time = data_end_time - data_start_time
+                forward_time = forward_end_time - forward_start_time
+                loss_time = loss_end_time - loss_start_time
+                backward_time = backward_end_time - backward_start_time
+                optimizer_time = optimizer_end_time - optimizer_start_time
+                
+                log(f"Step {step + 1} timing breakdown:")
+                log(f"  Data loading: {data_time:.3f}s ({data_time/step_total_time*100:.1f}%)")
+                log(f"  Forward pass: {forward_time:.3f}s ({forward_time/step_total_time*100:.1f}%)")
+                log(f"  Loss compute: {loss_time:.3f}s ({loss_time/step_total_time*100:.1f}%)")
+                log(f"  Backward pass: {backward_time:.3f}s ({backward_time/step_total_time*100:.1f}%)")
+                log(f"  Optimizer: {optimizer_time:.3f}s ({optimizer_time/step_total_time*100:.1f}%)")
+                log(f"  Total step time: {step_total_time:.3f}s")
+            
             # Logging
             if (step + 1) % 100 == 0:
-                mem_info = f", GPU_mem={torch.cuda.memory_allocated() / 1024**3:.1f}GB" if torch.cuda.is_available() else ""
+                mem_info = f", {get_gpu_memory_info()}" if torch.cuda.is_available() else ""
                 log(f"Step {step + 1}: loss={avg_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f}, grad_norm={grad_norm:.4f}{mem_info}")
             
             # Save best model
             if avg_loss < best_loss:
                 best_loss = avg_loss
-                save_checkpoint(model, optimizer, step, config['checkpoint_path'], best_loss=best_loss)
+                save_checkpoint(model, optimizer, step, config['checkpoint_path'], 
+                              best_loss=best_loss, additional_metadata={'data_pointer': data_pointer})
                 log(f"Best model saved at step {step + 1} with loss {best_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f} to {config['checkpoint_path']}")
             
             # Periodic checkpoint save every 2000 steps
             if (step + 1) % 2000 == 0:
                 periodic_checkpoint_path = config['checkpoint_path'].replace('.pt', f'_step_{step + 1}.pt')
-                save_checkpoint(model, optimizer, step, periodic_checkpoint_path, best_loss=best_loss)
+                save_checkpoint(model, optimizer, step, periodic_checkpoint_path, 
+                              best_loss=best_loss, additional_metadata={'data_pointer': data_pointer})
                 log(f"Periodic checkpoint saved at step {step + 1} to {periodic_checkpoint_path}")
+        
+        # PyTorch profiler step
+        if profiler is not None:
+            profiler.step()
+            # Stop profiler after a few steps to avoid large files
+            if step > start_step + 10:
+                profiler.stop()
+                profiler = None
+                log("PyTorch profiler stopped - check ./profiler_logs for trace files")
+    
+    # Clean up profiler if still running
+    if profiler is not None:
+        profiler.stop()
     
     # Save learning curve
     np.save(config['curve_path'], np.array(losses))

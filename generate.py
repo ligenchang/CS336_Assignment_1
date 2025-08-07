@@ -60,7 +60,22 @@ def nucleus_sampling(probs, top_p=1.0):
 
 def load_checkpoint(path, device):
     checkpoint = torch.load(path, map_location=device)
-    weights = {k: v.to(device).clone().detach().requires_grad_(False) for k, v in checkpoint['weights'].items()}
+    
+    # Handle both old and new checkpoint formats
+    if 'weights' in checkpoint:
+        # Old format: direct weights dictionary
+        weights = {k: v.to(device).clone().detach().requires_grad_(False) for k, v in checkpoint['weights'].items()}
+    elif 'model_state_dict' in checkpoint:
+        # New format: model state dict from train.py
+        weights = {k: v.to(device).clone().detach().requires_grad_(False) for k, v in checkpoint['model_state_dict'].items()}
+    else:
+        # Try to use the checkpoint directly as weights (legacy format)
+        try:
+            weights = {k: v.to(device).clone().detach().requires_grad_(False) for k, v in checkpoint.items() 
+                      if isinstance(v, torch.Tensor)}
+        except Exception as e:
+            raise KeyError(f"Could not find model weights in checkpoint. Available keys: {list(checkpoint.keys())}. Error: {e}")
+    
     return weights
 
 
