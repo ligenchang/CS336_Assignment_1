@@ -18,6 +18,13 @@ from cs336_basics.nn_utils import cross_entropy, TransformerLM
 from cs336_basics.optimizer import AdamW
 from cs336_basics.lr_scheduler import get_lr_cosine_schedule
 from cs336_basics.serialization import save_checkpoint, load_checkpoint_enhanced, checkpoint_exists
+from instruction_tuning import (
+    InstructionDataProcessor, 
+    create_instruction_batch, 
+    masked_cross_entropy, 
+    load_instruction_data,
+    save_instruction_data
+)
 
 
 # =============================================================================
@@ -102,20 +109,20 @@ def get_dataset_defaults(dataset_name):
     """Get default configuration for specified dataset."""
     if dataset_name == 'owt':
         return {
-            'tokens_path': 'openwebtext_pretok_tokens.pkl',
+            'tokens_path': '/Users/michaelli/Downloads/CS336_Assignment_1/openwebtext_pretok_tokens.pkl',
             'checkpoint_path': 'openwebtext_transformer_ckpt.pt',
             'curve_path': 'openwebtext_learning_curve.npy',
             'vocab_size': 32000,
             'context_length': 1024,
-            'd_model': 768,   # Back to original
-            'd_ff': 2048,     # Back to original
-            'num_layers': 24, # Back to original
-            'num_heads': 12,  # Back to original
-            'batch_size': 24, # Back to original
+            'd_model': 768,  
+            'd_ff': 2048,  
+            'num_layers': 24, 
+            'num_heads': 12, 
+            'batch_size': 24,
             'num_steps': 60000,
-            'accumulation_steps': 16, # Back to original
-            'base_lr': 6e-4,  # Back to original
-            'min_lr': 6e-5,   # Back to original
+            'accumulation_steps': 16, 
+            'base_lr': 6e-4, 
+            'min_lr': 6e-5, 
             'max_grad_norm': 1.0,
             'rope_theta': 10000
         }
@@ -189,6 +196,14 @@ def parse_args_and_config():
     parser.add_argument('--auto_batch_size', action='store_true', 
                        help='Automatically find optimal batch size for available GPU memory')
     
+    # Instruction tuning options
+    parser.add_argument('--instruction_tuning', action='store_true',
+                       help='Enable instruction tuning mode')
+    parser.add_argument('--instruction_data_path', type=str, default=None,
+                       help='Path to instruction dataset JSON file')
+    parser.add_argument('--processed_instruction_data_path', type=str, default=None,
+                       help='Path to save/load processed instruction data (pkl)')
+    
     args = parser.parse_args()
     
     # Get dataset defaults
@@ -217,7 +232,10 @@ def parse_args_and_config():
         'profile': args.profile,
         'torch_profiler': args.torch_profiler,
         'compile_model': args.compile_model,
-        'auto_batch_size': args.auto_batch_size
+        'auto_batch_size': args.auto_batch_size,
+        'instruction_tuning': args.instruction_tuning,
+        'instruction_data_path': args.instruction_data_path,
+        'processed_instruction_data_path': args.processed_instruction_data_path
     }
     
     return config
@@ -539,6 +557,79 @@ def forward_pass(config, model, x, use_amp):
     return logits
 
 
+def load_training_data(config):
+    """Load training data based on training mode (standard or instruction tuning)."""
+    if config.get('instruction_tuning', False):
+        # Instruction tuning mode
+        print("Loading instruction tuning data...")
+        
+        # Check if processed data exists
+        processed_path = config.get('processed_instruction_data_path')
+        if processed_path and os.path.exists(processed_path):
+            print(f"Loading processed instruction data from {processed_path}")
+            input_ids_list, target_ids_list, loss_masks_list = load_instruction_data(processed_path)
+            return {
+                'mode': 'instruction',
+                'input_ids': input_ids_list,
+                'target_ids': target_ids_list,
+                'loss_masks': loss_masks_list
+            }
+        
+        # Process raw instruction data
+        instruction_data_path = config.get('instruction_data_path')
+        if not instruction_data_path or not os.path.exists(instruction_data_path):
+            raise ValueError(f"Instruction data path not found: {instruction_data_path}")
+        
+        print(f"Processing instruction data from {instruction_data_path}")
+        
+        # Initialize tokenizer and processor
+        from cs336_basics.tokenizer import Tokenizer
+        
+        # Determine tokenizer files based on dataset
+        if config.get('dataset') == 'tinystories':
+            vocab_path = "tokenizer_output/tinystories_vocab.json"  # Adjust path as needed
+            merges_path = "tokenizer_output/tinystories_merges.txt"  # Adjust path as needed
+            special_tokens = ["<|endoftext|>", "<|instruction|>", "<|/instruction|>", "<|response|>", "<|/response|>"]
+        else:  # owt dataset
+            vocab_path = "tests/fixtures/gpt2_vocab.json"
+            merges_path = "tests/fixtures/gpt2_merges.txt"
+            special_tokens = ["<|endoftext|>", "<|instruction|>", "<|/instruction|>", "<|response|>", "<|/response|>"]
+        
+        print(f"Loading tokenizer from {vocab_path} and {merges_path}")
+        tokenizer = Tokenizer.from_files(vocab_path, merges_path, special_tokens=special_tokens)
+        
+        processor = InstructionDataProcessor(tokenizer, config['context_length'])
+        
+        # Load and process data
+        dataset = processor.load_instruction_dataset(instruction_data_path)
+        input_ids_list, target_ids_list, loss_masks_list = processor.process_dataset(dataset)
+        
+        print(f"Processed {len(input_ids_list)} instruction examples")
+        
+        # Save processed data for faster loading next time
+        if processed_path:
+            print(f"Saving processed data to {processed_path}")
+            save_instruction_data(input_ids_list, target_ids_list, loss_masks_list, processed_path)
+        
+        return {
+            'mode': 'instruction',
+            'input_ids': input_ids_list,
+            'target_ids': target_ids_list,
+            'loss_masks': loss_masks_list
+        }
+    else:
+        # Standard next-token prediction mode
+        print("Loading standard language modeling data...")
+        with open(config['tokens_path'], "rb") as f:
+            tokens = pickle.load(f)
+        tokens = np.array(tokens, dtype=np.int32)
+        
+        return {
+            'mode': 'standard',
+            'tokens': tokens
+        }
+
+
 def train_loop(config):
     """Main training loop."""
     # Setup environment
@@ -548,16 +639,27 @@ def train_loop(config):
     setup_gpu_optimization()
 
     # Load data
-    with open(config['tokens_path'], "rb") as f:
-        tokens = pickle.load(f)
-    tokens = np.array(tokens, dtype=np.int32)
-
+    training_data = load_training_data(config)
+    
     # Load or initialize model
     model, optimizer, start_step, best_loss, data_pointer = load_checkpoint_simple(config, device)
     model = model.to(device)
     
+    # Ensure model parameters require gradients
+    for param in model.parameters():
+        param.requires_grad_(True)
+    
+    print(f"Model has {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters")
+    
     # Find optimal batch size if requested
     if config.get('auto_batch_size', False):
+        # For auto batch size, we need tokens data
+        if training_data['mode'] == 'standard':
+            tokens = training_data['tokens']
+        else:
+            # For instruction tuning, create dummy tokens for batch size testing
+            tokens = np.zeros(10000, dtype=np.int32)
+        
         optimal_batch_size = find_optimal_batch_size(model, config, device, tokens)
         if optimal_batch_size != config['batch_size']:
             # Adjust accumulation steps to maintain similar effective batch size
@@ -573,6 +675,9 @@ def train_loop(config):
     
     # Compile model if requested
     model = compile_model_if_requested(model, config)
+    
+    # Ensure model is in training mode
+    model.train()
 
     # Training setup
     optimizer.zero_grad()
@@ -623,9 +728,24 @@ def train_loop(config):
             param_group["lr"] = get_lr_cosine_schedule(
                 step, config['base_lr'], config['min_lr'], warmup_iters, cosine_cycle_iters)
         
-        # Get batch
+        # Get batch - different logic for standard vs instruction tuning
         data_start_time = time.time() if config['profile'] else None
-        x, y, data_pointer = get_batch(tokens, config['batch_size'], config['context_length'], device, data_pointer)
+        
+        if training_data['mode'] == 'instruction':
+            # Instruction tuning mode
+            x, y, loss_mask = create_instruction_batch(
+                training_data['input_ids'],
+                training_data['target_ids'], 
+                training_data['loss_masks'],
+                config['batch_size'],
+                device
+            )
+        else:
+            # Standard language modeling mode
+            tokens = training_data['tokens']
+            x, y, data_pointer = get_batch(tokens, config['batch_size'], config['context_length'], device, data_pointer)
+            loss_mask = None  # No masking for standard LM
+            
         data_end_time = time.time() if config['profile'] else None
         
         # Forward pass
@@ -635,9 +755,16 @@ def train_loop(config):
         
         # Compute loss
         loss_start_time = time.time() if config['profile'] else None
-        loss = cross_entropy(logits.view(-1, config['vocab_size']), y.view(-1))
-        z_loss = 1e-4 * torch.mean(torch.logsumexp(logits, dim=-1))
-        loss = loss + z_loss
+        
+        if training_data['mode'] == 'instruction':
+            # Use masked cross-entropy for instruction tuning
+            loss = masked_cross_entropy(logits, y, loss_mask)
+        else:
+            # Standard cross-entropy for language modeling
+            loss = cross_entropy(logits.view(-1, config['vocab_size']), y.view(-1))
+            z_loss = 1e-4 * torch.mean(torch.logsumexp(logits, dim=-1))
+            loss = loss + z_loss
+            
         loss = loss / config['accumulation_steps']
         loss_end_time = time.time() if config['profile'] else None
         
@@ -687,15 +814,21 @@ def train_loop(config):
             # Save best model
             if avg_loss < best_loss:
                 best_loss = avg_loss
+                additional_metadata = {}
+                if training_data['mode'] == 'standard':
+                    additional_metadata['data_pointer'] = data_pointer
                 save_checkpoint(model, optimizer, step, config['checkpoint_path'], 
-                              best_loss=best_loss, additional_metadata={'data_pointer': data_pointer})
+                              best_loss=best_loss, additional_metadata=additional_metadata)
                 log(f"Best model saved at step {step + 1} with loss {best_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f} to {config['checkpoint_path']}")
             
             # Periodic checkpoint save every 2000 steps
             if (step + 1) % 2000 == 0:
                 periodic_checkpoint_path = config['checkpoint_path'].replace('.pt', f'_step_{step + 1}.pt')
+                additional_metadata = {}
+                if training_data['mode'] == 'standard':
+                    additional_metadata['data_pointer'] = data_pointer
                 save_checkpoint(model, optimizer, step, periodic_checkpoint_path, 
-                              best_loss=best_loss, additional_metadata={'data_pointer': data_pointer})
+                              best_loss=best_loss, additional_metadata=additional_metadata)
                 log(f"Periodic checkpoint saved at step {step + 1} to {periodic_checkpoint_path}")
         
         # PyTorch profiler step

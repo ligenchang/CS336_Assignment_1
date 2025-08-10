@@ -95,7 +95,7 @@ def main():
 
     # Dataset-specific defaults - match train.py exactly
     if args.dataset == 'owt':
-        default_ckpt = '/Users/michaelli/openwebtext_transformer_ckpt.pt'
+        default_ckpt = '/Users/michaelli/openwebtext_transformer_ckpt_instruction.pt'
         default_vocab = '/Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_vocab.pkl'
         default_merges = '/Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_merges.pkl'
         default_num_heads = 12  # From train.py OWT config
