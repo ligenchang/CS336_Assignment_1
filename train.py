@@ -102,20 +102,20 @@ def get_dataset_defaults(dataset_name):
     """Get default configuration for specified dataset."""
     if dataset_name == 'owt':
         return {
-            'tokens_path': 'openwebtext_pretok_tokens.pkl',
+             'tokens_path': 'openwebtext_pretok_tokens.pkl',
             'checkpoint_path': 'openwebtext_transformer_ckpt.pt',
             'curve_path': 'openwebtext_learning_curve.npy',
             'vocab_size': 32000,
             'context_length': 1024,
-            'd_model': 768,   # Back to original
-            'd_ff': 2048,     # Back to original
-            'num_layers': 24, # Back to original
-            'num_heads': 12,  # Back to original
-            'batch_size': 24, # Back to original
-            'num_steps': 60000,
-            'accumulation_steps': 16, # Back to original
-            'base_lr': 6e-4,  # Back to original
-            'min_lr': 6e-5,   # Back to original
+            'd_model': 768,   # GPT-2 small style
+            'd_ff': 3072,     # GPT-2 small style
+            'num_layers': 12, # GPT-2 small style
+            'num_heads': 12,  # GPT-2 small style
+            'batch_size': 16, # Reasonable for this size
+            'num_steps': 160000, # Keep Chinchilla token budget
+            'accumulation_steps': 8, # Reasonable for this size
+            'base_lr': 3e-4,  # Standard LR for GPT-2 small
+            'min_lr': 1e-5,   # Proportionally lower min LR
             'max_grad_norm': 1.0,
             'rope_theta': 10000
         }
@@ -551,10 +551,33 @@ def train_loop(config):
     with open(config['tokens_path'], "rb") as f:
         tokens = pickle.load(f)
     tokens = np.array(tokens, dtype=np.int32)
+    print(f"[INFO] Loaded {len(tokens):,} tokens from {config['tokens_path']}")
 
     # Load or initialize model
     model, optimizer, start_step, best_loss, data_pointer = load_checkpoint_simple(config, device)
     model = model.to(device)
+    
+    # Calculate and log parameter counts for Chinchilla compliance
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    embedding_params = model.token_embeddings.weight.numel() + model.lm_head.weight.numel()
+    non_embedding_params = total_params - embedding_params
+    
+    print(f"[INFO] Model parameter breakdown:")
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Embedding parameters (token + lm_head): {embedding_params:,}")
+    print(f"  Non-embedding parameters: {non_embedding_params:,}")
+    print(f"[INFO] Chinchilla scaling analysis:")
+    print(f"  Training tokens: {len(tokens):,}")
+    print(f"  Chinchilla optimal non-embedding params: ~{len(tokens):,}")
+    print(f"  Actual non-embedding params: {non_embedding_params:,}")
+    ratio = non_embedding_params / len(tokens)
+    print(f"  Parameter/Token ratio: {ratio:.3f} (optimal ≈ 1.0)")
+    if 0.8 <= ratio <= 1.2:
+        print(f"  ✅ Model size is Chinchilla-optimal!")
+    elif ratio < 0.8:
+        print(f"  ⚠️  Model is undertrained (too few parameters)")
+    else:
+        print(f"  ⚠️  Model is overtrained (too many parameters)")
     
     # Find optimal batch size if requested
     if config.get('auto_batch_size', False):
