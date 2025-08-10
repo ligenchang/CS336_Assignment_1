@@ -5,7 +5,6 @@ __pycache__/
 *.pt
 data/
 *.pkl
-*.npy
 
 # C extensions
 *.so

@@ -73,18 +73,3 @@ python train.py --dataset owt --use_gradient_checkpointing --checkpoint_every_n_
 
 # Less aggressive (checkpoint every 8 layers) 
 python train.py --dataset owt --use_gradient_checkpointing --checkpoint_every_n_layers 8
-
-python download_standard_dataset.py --dataset alpaca
-
-python create_processed_instructions.py --instruction_data_path /Users/michaelli/Documents/CS336_Assignment/standard_instruction_data.json --output_path processed_full_alpaca_instructions.pkl --vocab_path /Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_vocab.pkl --merges_path /Users/michaelli/Downloads/CS336_Assignment_1/owt_bpe_merges.pkl
-
-
-python train.py \
-  --instruction_tuning \
-  --processed_instruction_data_path processed_standard_instructions.pkl \
-  --batch_size 4 \
-  --accumulation_steps 8 \
-  --base_lr 5e-5 \
-  --num_steps 70000 \
-  --checkpoint_path /Users/michaelli/openwebtext_transformer_ckpt_instruction.pt
-
