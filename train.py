@@ -67,30 +67,27 @@ def checkpointed_transformer_lm(model, in_indices, checkpoint_every_n_layers=4):
 # =============================================================================
 
 def get_batch(tokens, batch_size, context_length, device, data_pointer):
-    max_start = len(tokens) - context_length - 1
-    batch_x, batch_y = [], []
-    
-    for _ in range(batch_size):
-        # Check and wrap around BEFORE extracting data
-        if data_pointer >= max_start:
-            data_pointer = 0
-            
-        # Extract sequences
-        x = tokens[data_pointer:data_pointer + context_length]
-        y = tokens[data_pointer + 1:data_pointer + context_length + 1]
-        batch_x.append(x)
-        batch_y.append(y)
-        
-        # Advance pointer for next sample
-        data_pointer += context_length
-        
-        # Additional safety check: if advancing puts us past the boundary, wrap around
-        if data_pointer >= max_start:
-            data_pointer = 0
-    
-    # Use torch.stack for better performance
-    x = torch.stack([torch.from_numpy(seq) for seq in batch_x]).to(device, dtype=torch.long, non_blocking=True)
-    y = torch.stack([torch.from_numpy(seq) for seq in batch_y]).to(device, dtype=torch.long, non_blocking=True)
+    """
+    Fully vectorized, GPU-native batch creation for maximum speed.
+    Assumes tokens is a 1D torch tensor on the target device.
+    """
+    max_start = tokens.size(0) - context_length - 1
+    # Compute start indices for each sample in the batch
+    starts = torch.arange(
+        data_pointer, data_pointer + batch_size * context_length, context_length, device='cpu'
+    ) % max_start
+    # For each start, create indices for the context window
+    offsets = torch.arange(context_length, device='cpu')
+    idx = starts.unsqueeze(1) + offsets.unsqueeze(0)  # (batch_size, context_length)
+    idx_y = idx + 1
+    # Move indices to device if needed
+    idx = idx.to(device)
+    idx_y = idx_y.to(device)
+    # Gather input and target sequences
+    x = tokens[idx]
+    y = tokens[idx_y]
+    # Advance data_pointer
+    data_pointer = (data_pointer + batch_size * context_length) % max_start
     return x, y, data_pointer
 
 
@@ -114,7 +111,7 @@ def get_dataset_defaults(dataset_name):
             'batch_size': 16, # Reasonable for this size
             'num_steps': 160000, # Keep Chinchilla token budget
             'accumulation_steps': 8, # Reasonable for this size
-            'base_lr': 3e-4,  # Standard LR for GPT-2 small
+            'base_lr': 4e-4,  # Standard LR for GPT-2 small
             'min_lr': 1e-5,   # Proportionally lower min LR
             'max_grad_norm': 1.0,
             'rope_theta': 10000
@@ -552,6 +549,9 @@ def train_loop(config):
         tokens = pickle.load(f)
     tokens = np.array(tokens, dtype=np.int32)
     print(f"[INFO] Loaded {len(tokens):,} tokens from {config['tokens_path']}")
+    # Preload tokens to GPU as a torch tensor for fast batch creation
+    device = setup_device()
+    tokens = torch.from_numpy(tokens).to(device, dtype=torch.long, non_blocking=True)
 
     # Load or initialize model
     model, optimizer, start_step, best_loss, data_pointer = load_checkpoint_simple(config, device)
@@ -613,6 +613,9 @@ def train_loop(config):
     
     def log(msg):
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+    if config.get('profile', False):
+        log("Profiling is ENABLED: timing breakdowns will be printed for every optimizer step.")
     
     # Training info
     log("Starting training...")
@@ -641,10 +644,17 @@ def train_loop(config):
     for step in range(start_step, config['num_steps']):
         step_start_time = time.time() if config['profile'] else None
         
-        # Update learning rate
+        # Use constant lr for first 90%, then linearly decay to min_lr in last 10%
+        progress = (step - start_step) / max(1, config['num_steps'] - start_step)
+        if progress < 0.9:
+            lr = config['base_lr']
+        else:
+            # Linear decay from base_lr to min_lr over last 10%
+            decay_progress = (progress - 0.9) / 0.1
+            lr = config['base_lr'] * (1 - decay_progress) + config['min_lr'] * decay_progress
+            lr = max(lr, config['min_lr'])
         for param_group in optimizer.param_groups:
-            param_group["lr"] = get_lr_cosine_schedule(
-                step, config['base_lr'], config['min_lr'], warmup_iters, cosine_cycle_iters)
+            param_group["lr"] = lr
         
         # Get batch
         data_start_time = time.time() if config['profile'] else None
@@ -685,30 +695,33 @@ def train_loop(config):
             avg_loss = accum_loss
             losses.append(avg_loss)
             
-            # Detailed timing info
-            if config['profile'] and step_start_time is not None:
-                step_total_time = time.time() - step_start_time
-                data_time = data_end_time - data_start_time
-                forward_time = forward_end_time - forward_start_time
-                loss_time = loss_end_time - loss_start_time
-                backward_time = backward_end_time - backward_start_time
-                optimizer_time = optimizer_end_time - optimizer_start_time
-                
+            # Detailed timing info (always print if profiling is enabled)
+            if config['profile']:
+                step_total_time = (time.time() - step_start_time) if step_start_time is not None else 0.0
+                data_time = (data_end_time - data_start_time) if (data_end_time and data_start_time) else 0.0
+                forward_time = (forward_end_time - forward_start_time) if (forward_end_time and forward_start_time) else 0.0
+                loss_time = (loss_end_time - loss_start_time) if (loss_end_time and loss_start_time) else 0.0
+                backward_time = (backward_end_time - backward_start_time) if (backward_end_time and backward_start_time) else 0.0
+                optimizer_time = (optimizer_end_time - optimizer_start_time) if (optimizer_end_time and optimizer_start_time) else 0.0
                 log(f"Step {step + 1} timing breakdown:")
-                log(f"  Data loading: {data_time:.3f}s ({data_time/step_total_time*100:.1f}%)")
-                log(f"  Forward pass: {forward_time:.3f}s ({forward_time/step_total_time*100:.1f}%)")
-                log(f"  Loss compute: {loss_time:.3f}s ({loss_time/step_total_time*100:.1f}%)")
-                log(f"  Backward pass: {backward_time:.3f}s ({backward_time/step_total_time*100:.1f}%)")
-                log(f"  Optimizer: {optimizer_time:.3f}s ({optimizer_time/step_total_time*100:.1f}%)")
+                log(f"  Data loading: {data_time:.3f}s ({(data_time/step_total_time*100) if step_total_time else 0:.1f}%)")
+                log(f"  Forward pass: {forward_time:.3f}s ({(forward_time/step_total_time*100) if step_total_time else 0:.1f}%)")
+                log(f"  Loss compute: {loss_time:.3f}s ({(loss_time/step_total_time*100) if step_total_time else 0:.1f}%)")
+                log(f"  Backward pass: {backward_time:.3f}s ({(backward_time/step_total_time*100) if step_total_time else 0:.1f}%)")
+                log(f"  Optimizer: {optimizer_time:.3f}s ({(optimizer_time/step_total_time*100) if step_total_time else 0:.1f}%)")
                 log(f"  Total step time: {step_total_time:.3f}s")
             
-            # Logging
-            if (step + 1) % 100 == 0:
+            # Progress logging every 20 steps
+            if (step + 1) % 20 == 0 or (step + 1) == config['num_steps']:
+                total_steps = config['num_steps']
+                finished_steps = step + 1
+                percent = 100.0 * finished_steps / max(1, total_steps)
                 mem_info = f", {get_gpu_memory_info()}" if torch.cuda.is_available() else ""
-                log(f"Step {step + 1}: loss={avg_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f}, grad_norm={grad_norm:.4f}{mem_info}")
+                timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                print(f"[{timestamp}] Step {finished_steps}/{total_steps} ({percent:.1f}%): loss={avg_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f}, grad_norm={grad_norm:.4f}{mem_info}")
             
-            # Save best model
-            if avg_loss < best_loss:
+            # Save best model less frequently (every 500 steps)
+            if avg_loss < best_loss and (step + 1) % 500 == 0:
                 best_loss = avg_loss
                 save_checkpoint(model, optimizer, step, config['checkpoint_path'], 
                               best_loss=best_loss, additional_metadata={'data_pointer': data_pointer})
