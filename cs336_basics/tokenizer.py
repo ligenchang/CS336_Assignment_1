@@ -184,57 +184,6 @@ class Tokenizer:
         return tokens
 
 
-    # def _bpe_encode(self, byte_encoded: bytes) -> List[int]:
-    #     """
-    #     Encode a byte string using BPE.
-
-    #     Args:
-    #         byte_encoded: The UTF-8 encoded bytes
-
-    #     Returns:
-    #         A list of token ids
-    #     """
-    #     if not byte_encoded:
-    #         return []
-
-    #     tokens = [bytes([b]) for b in byte_encoded]
-    #     merge_ranks = self.merge_ranks
-    #     byte_to_id = self.byte_to_id
-
-    #     while len(tokens) > 1:
-    #         best_pair = None
-    #         best_rank = float('inf')
-
-    #         # Identify best mergeable pair in a single pass
-    #         for i in range(len(tokens) - 1):
-    #             pair = (tokens[i], tokens[i + 1])
-    #             if pair in merge_ranks:
-    #                 rank = merge_ranks[pair]
-    #                 merged = pair[0] + pair[1]
-    #                 if merged in byte_to_id and rank < best_rank:
-    #                     best_rank = rank
-    #                     best_pair = pair
-
-    #         if best_pair is None:
-    #             break
-
-    #         # Merge all instances of the best pair
-    #         result = []
-    #         i = 0
-    #         first, second = best_pair
-    #         while i < len(tokens):
-    #             if i < len(tokens) - 1 and tokens[i] == first and tokens[i + 1] == second:
-    #                 result.append(first + second)
-    #                 i += 2
-    #             else:
-    #                 result.append(tokens[i])
-    #                 i += 1
-
-    #         tokens = result
-
-    #     return [byte_to_id[tok] for tok in tokens if tok in byte_to_id]
-
-
     def _bpe_encode(self, byte_encoded: bytes) -> List[int]:
         if not byte_encoded:
             return []

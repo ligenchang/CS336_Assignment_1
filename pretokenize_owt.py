@@ -11,9 +11,6 @@ from cs336_basics.tokenizer import Tokenizer
 def ts(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
-
-
-
 def find_chunk_boundaries(file, desired_num_chunks, split_special_token):
     file.seek(0, os.SEEK_END)
     file_size = file.tell()
@@ -40,29 +37,30 @@ def find_chunk_boundaries(file, desired_num_chunks, split_special_token):
 
 
 def pretokenize_chunk(args):
-
     chunk_idx, start, end, raw_text_path, tmp_dir, vocab_path, merges_path, special_token = args
 
     t0 = time.time()
     ts(f"[Chunk {chunk_idx}] Starting tokenization (offsets {start}-{end})")
     tokenizer = Tokenizer.from_files(vocab_path, merges_path, special_tokens=[special_token])
 
-    tokens = []
-    chunk_size = 64 * 1024 * 1024  # 64MB
+    chunk_size = 64 * 1024 * 1024  # read size
+    batch_size = 5000               # number of lines per batch before writing
 
-
-    with open(raw_text_path, "rb") as f:
+    tmp_path = os.path.join(tmp_dir, f"chunk_{chunk_idx}.pkl")
+    with open(raw_text_path, "rb") as f, open(tmp_path, "wb") as out_f:
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         pos = start
         leftover = b""
         total_bytes = end - start
-        subchunk_idx = 0
+        processed_bytes = 0
+
+        lines_buffer = []
 
         while pos < end:
             read_end = min(pos + chunk_size, end)
             chunk_bytes = leftover + mm[pos:read_end]
 
-            # Decode carefully
+            # Safe decode
             for i in range(4, -1, -1):
                 try:
                     chunk = chunk_bytes[:len(chunk_bytes)-i].decode("utf-8")
@@ -74,36 +72,57 @@ def pretokenize_chunk(args):
                 chunk = chunk_bytes[:-1].decode("utf-8", errors="ignore")
                 leftover = chunk_bytes[-1:]
 
-            lines = chunk.splitlines()
-            tokens.extend(tokenizer.encode_iterable(lines))
+            lines_buffer.extend(chunk.splitlines())
+
+            # Process in batches
+            while len(lines_buffer) >= batch_size:
+                batch = lines_buffer[:batch_size]
+                del lines_buffer[:batch_size]
+                tokens = tokenizer.encode_iterable(batch)
+                pickle.dump(list(tokens), out_f)
+
+                # Update processed bytes based on estimated size of this batch
+                batch_bytes = sum(len(line.encode("utf-8")) for line in batch)
+                processed_bytes += batch_bytes
+                percent = 100.0 * processed_bytes / total_bytes
+                ts(f"[Chunk {chunk_idx}] Progress: {percent:.1f}% ({processed_bytes}/{total_bytes} bytes)")
 
             pos = read_end
-            subchunk_idx += 1
 
-            # Progress reporting
-            percent = 100.0 * (pos - start) / total_bytes if total_bytes > 0 else 100.0
-            ts(f"[Chunk {chunk_idx}] Progress: {percent:.1f}% ({pos - start}/{total_bytes} bytes)")
+        # Remaining lines
+        if lines_buffer:
+            tokens = tokenizer.encode_iterable(lines_buffer)
+            pickle.dump(tokens, out_f)
+            batch_bytes = sum(len(line.encode("utf-8")) for line in lines_buffer)
+            processed_bytes += batch_bytes
+            percent = 100.0 * processed_bytes / total_bytes
+            ts(f"[Chunk {chunk_idx}] Progress: {percent:.1f}% ({processed_bytes}/{total_bytes} bytes)")
 
+        # Leftover
         if leftover:
             try:
                 chunk = leftover.decode("utf-8")
-                lines = chunk.splitlines()
-                tokens.extend(tokenizer.encode_iterable(lines))
+                tokens = tokenizer.encode_iterable(chunk.splitlines())
+                pickle.dump(tokens, out_f)
+                batch_bytes = len(leftover)
+                processed_bytes += batch_bytes
+                percent = 100.0 * processed_bytes / total_bytes
+                ts(f"[Chunk {chunk_idx}] Progress: {percent:.1f}% ({processed_bytes}/{total_bytes} bytes)")
             except Exception:
                 pass
+
         mm.close()
 
-    tmp_path = os.path.join(tmp_dir, f"chunk_{chunk_idx}.pkl")
-    with open(tmp_path, "wb") as f:
-        pickle.dump(tokens, f)
-
     t1 = time.time()
-    ts(f"[Chunk {chunk_idx}] Tokenized and saved {len(tokens)} tokens in {t1 - t0:.2f} sec")
+    ts(f"[Chunk {chunk_idx}] Tokenized directly to disk in {t1 - t0:.2f} sec")
     return tmp_path
+
 
 
 def main():
     raw_text_path = "data/owt_train.txt"
+    # vocab_path = "owt_bpe_vocab.pkl" 
+    # merges_path = "owt_bpe_merges.pkl" 
     vocab_path = "owt_bpe_vocab.pkl" 
     merges_path = "owt_bpe_merges.pkl" 
     output_tokens_path = "openwebtext_pretok_tokens.pkl"
@@ -133,12 +152,23 @@ def main():
 
         ts("Tokenization complete. Aggregating tokens...")
         total_tokens = 0
+        # with open(output_tokens_path, "wb") as out_f:
+        #     for tmp_path in sorted(tmp_paths, key=lambda x: int(os.path.basename(x).split('_')[1].split('.')[0])):
+        #         with open(tmp_path, "rb") as f:
+        #             tokens = pickle.load(f)
+        #             pickle.dump(tokens, out_f)
+        #             total_tokens += len(tokens)
+
         with open(output_tokens_path, "wb") as out_f:
             for tmp_path in sorted(tmp_paths, key=lambda x: int(os.path.basename(x).split('_')[1].split('.')[0])):
                 with open(tmp_path, "rb") as f:
-                    tokens = pickle.load(f)
-                    pickle.dump(tokens, out_f)
-                    total_tokens += len(tokens)
+                    try:
+                        while True:
+                            token_batch = pickle.load(f)
+                            pickle.dump(token_batch, out_f)
+                            total_tokens += len(token_batch)
+                    except EOFError:
+                        pass
 
         ts(f"Saved {total_tokens} tokens to {output_tokens_path}.")
 
