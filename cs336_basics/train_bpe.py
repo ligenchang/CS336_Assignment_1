@@ -72,6 +72,11 @@ def tokenize_chunk(filename: str, start: int, end: int, special_tokens: List[str
         chunk_end = min(end, file_size)
         pos = start
         leftover = ""
+        total_bytes = chunk_end - start
+        processed_bytes = 0
+        chunk_id = start // max(1, (file_size // 1000))  # rough id for log
+        last_logged_percent = -10
+        last_logged_mb = 0
         while pos < chunk_end:
             read_end = min(pos + buffer_size, chunk_end)
             chunk_bytes = mm[pos:read_end]
@@ -105,6 +110,14 @@ def tokenize_chunk(filename: str, start: int, end: int, special_tokens: List[str
                     # Convert bytes to token IDs (one per byte)
                     token_ids = tuple(token_to_id.setdefault(bytes([b]), len(token_to_id)) for b in token_bytes)
                     word_freqs[token_ids] += 1
+            processed_bytes += (read_end - pos)
+            percent = 100.0 * processed_bytes / total_bytes if total_bytes > 0 else 100.0
+            mb_done = processed_bytes // (100 * 1024 * 1024)
+            # Log every 10% or every 100MB
+            if percent - last_logged_percent >= 10 or mb_done > last_logged_mb or percent == 100.0:
+                print(f"[tokenize_chunk] Chunk {chunk_id}: {percent:.1f}% ({processed_bytes}/{total_bytes} bytes)")
+                last_logged_percent = percent
+                last_logged_mb = mb_done
             pos = read_end
         mm.close()
     return word_freqs

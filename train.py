@@ -99,7 +99,7 @@ def get_dataset_defaults(dataset_name):
     """Get default configuration for specified dataset."""
     if dataset_name == 'owt':
         return {
-             'tokens_path': 'openwebtext_pretok_tokens.pkl',
+            'tokens_path': 'openwebtext_pretok_tokens.pkl',
             'checkpoint_path': 'openwebtext_transformer_ckpt.pt',
             'curve_path': 'openwebtext_learning_curve.npy',
             'vocab_size': 32000,
@@ -111,7 +111,7 @@ def get_dataset_defaults(dataset_name):
             'batch_size': 16, # Reasonable for this size
             'num_steps': 160000, # Keep Chinchilla token budget
             'accumulation_steps': 8, # Reasonable for this size
-            'base_lr': 4e-4,  # Standard LR for GPT-2 small
+            'base_lr': 6e-4,  # Standard LR for GPT-2 small
             'min_lr': 1e-5,   # Proportionally lower min LR
             'max_grad_norm': 1.0,
             'rope_theta': 10000
@@ -544,17 +544,78 @@ def train_loop(config):
 
     setup_gpu_optimization()
 
-    # Load data
-    with open(config['tokens_path'], "rb") as f:
-        tokens = pickle.load(f)
-    tokens = np.array(tokens, dtype=np.int32)
-    print(f"[INFO] Loaded {len(tokens):,} tokens from {config['tokens_path']}")
-    # Preload tokens to GPU as a torch tensor for fast batch creation
-    device = setup_device()
-    tokens = torch.from_numpy(tokens).to(device, dtype=torch.long, non_blocking=True)
 
-    # Load or initialize model
+    # --- Async streaming token loader ---
+    import threading
+    import queue
+
+    def token_stream(tokens_path, start_offset=0):
+        global_offset = 0
+        first_epoch = True
+        while True:  # multi-epoch loop
+            if first_epoch and start_offset != 0:
+                print(f"[DEBUG] token_stream: using start_offset={start_offset}")
+            with open(tokens_path, "rb") as f:
+                while True:
+                    try:
+                        doc = pickle.load(f)
+                        doc_len = len(doc)
+                        if global_offset + doc_len <= start_offset:
+                            # Skip this entire chunk
+                            global_offset += doc_len
+                            continue
+                        else:
+                            # Yield tokens from start_offset within this chunk
+                            start_in_doc = max(0, start_offset - global_offset)
+                            for idx in range(start_in_doc, doc_len):
+                                yield doc[idx]
+                            global_offset += doc_len
+                    except EOFError:
+                        break
+            # After first epoch, reset offsets for subsequent epochs
+            global_offset = 0
+            start_offset = 0
+            first_epoch = False
+
+
+    def prefetch_tokens(tokens_path, start_offset=0, buffer_size=10_000_000):
+        q = queue.Queue(maxsize=2)
+        def loader():
+            print(f"[DEBUG] prefetch_tokens.loader: starting from start_offset={start_offset}")
+            buf = []
+            total_tokens = 0
+            next_log = 100_000_000
+            global_offset = start_offset
+            for token in token_stream(tokens_path, start_offset=start_offset):
+                buf.append(token)
+                total_tokens += 1
+                if total_tokens >= next_log:
+                    print(f"[INFO] Streaming loader: {total_tokens:,} tokens utilized so far.")
+                    next_log += 100_000_000
+                if len(buf) >= buffer_size:
+                    q.put((global_offset, np.array(buf, dtype=np.int32)))
+                    global_offset += len(buf)
+                    buf = []
+            if buf:
+                q.put((global_offset, np.array(buf, dtype=np.int32)))
+            print("[INFO] Completed one pass through the dataset. Restarting token stream for next epoch.")
+        threading.Thread(target=loader, daemon=True).start()
+        return q
+
+    print(f"[INFO] Streaming tokens from {config['tokens_path']} with async prefetch...")
+    device = setup_device()
+    # Load or initialize model and get data_pointer before using it
     model, optimizer, start_step, best_loss, data_pointer = load_checkpoint_simple(config, device)
+    # TEMP: Hardcode data_pointer for debugging/resume
+    # data_pointer = 400_000_000
+    # print(f"[DEBUG] Overriding data_pointer: stream will start from token {data_pointer}")
+    start_offset = data_pointer
+    tokens_queue = prefetch_tokens(config['tokens_path'], start_offset=start_offset)
+    buffer_global_offset, tokens_np = tokens_queue.get()
+    print(f"[INFO] Loaded buffer of {len(tokens_np):,} tokens starting at global offset {buffer_global_offset} (streaming mode)")
+    buffer_tokens = torch.from_numpy(tokens_np).to(device, dtype=torch.long, non_blocking=True)
+    buffer_pointer = start_offset - buffer_global_offset  # position inside buffer
+    buffer_len = buffer_tokens.size(0)
     model = model.to(device)
     
     # Calculate and log parameter counts for Chinchilla compliance
@@ -566,11 +627,41 @@ def train_loop(config):
     print(f"  Total parameters: {total_params:,}")
     print(f"  Embedding parameters (token + lm_head): {embedding_params:,}")
     print(f"  Non-embedding parameters: {non_embedding_params:,}")
+    # # Load total number of tokens in the dataset for Chinchilla analysis
+    # try:
+    #     from tqdm import tqdm
+    # except ImportError:
+    #     tqdm = None
+    # try:
+    #     with open(config['tokens_path'], "rb") as f:
+    #         doc_count = 0
+    #         total_tokens = 0
+    #         print("[INFO] Counting total tokens in dataset for Chinchilla analysis (memory efficient)...")
+    #         if tqdm is not None:
+    #             pbar = tqdm(desc="Counting docs", unit="doc")
+    #         else:
+    #             pbar = None
+    #         while True:
+    #             try:
+    #                 doc = pickle.load(f)
+    #                 total_tokens += len(doc)
+    #                 doc_count += 1
+    #                 if pbar is not None:
+    #                     pbar.update(1)
+    #             except EOFError:
+    #                 break
+    #         if pbar is not None:
+    #             pbar.close()
+    #         print(f"[INFO] Total docs: {doc_count}, total tokens: {total_tokens:,}")
+    # except Exception as e:
+    #     print(f"[WARN] Could not load total token count for Chinchilla analysis: {e}")
+    #     total_tokens = len(buffer_tokens)
+    total_tokens = 8581129216
     print(f"[INFO] Chinchilla scaling analysis:")
-    print(f"  Training tokens: {len(tokens):,}")
-    print(f"  Chinchilla optimal non-embedding params: ~{len(tokens):,}")
+    print(f"  Training tokens (total in dataset): {total_tokens:,}")
+    print(f"  Chinchilla optimal non-embedding params: ~{total_tokens:,}")
     print(f"  Actual non-embedding params: {non_embedding_params:,}")
-    ratio = non_embedding_params / len(tokens)
+    ratio = non_embedding_params / total_tokens if total_tokens > 0 else float('inf')
     print(f"  Parameter/Token ratio: {ratio:.3f} (optimal ≈ 1.0)")
     if 0.8 <= ratio <= 1.2:
         print(f"  ✅ Model size is Chinchilla-optimal!")
@@ -581,7 +672,7 @@ def train_loop(config):
     
     # Find optimal batch size if requested
     if config.get('auto_batch_size', False):
-        optimal_batch_size = find_optimal_batch_size(model, config, device, tokens)
+        optimal_batch_size = find_optimal_batch_size(model, config, device, buffer_tokens)
         if optimal_batch_size != config['batch_size']:
             # Adjust accumulation steps to maintain similar effective batch size
             effective_batch_size = config['batch_size'] * config['accumulation_steps']
@@ -641,9 +732,13 @@ def train_loop(config):
         profiler = None
     
     # Main training loop
+    # buffer_tokens is already set above
+    # buffer_pointer and buffer_len are already set above
+    last_best_save_step = -500  # So first possible save is at step 0
+    min_best_save_interval = 500
     for step in range(start_step, config['num_steps']):
         step_start_time = time.time() if config['profile'] else None
-        
+
         # Use constant lr for first 90%, then linearly decay to min_lr in last 10%
         progress = (step - start_step) / max(1, config['num_steps'] - start_step)
         if progress < 0.9:
@@ -655,10 +750,25 @@ def train_loop(config):
             lr = max(lr, config['min_lr'])
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-        
-        # Get batch
+
+        # Get batch, refill buffer if needed
         data_start_time = time.time() if config['profile'] else None
-        x, y, data_pointer = get_batch(tokens, config['batch_size'], config['context_length'], device, data_pointer)
+        batch_size = config['batch_size']
+        context_length = config['context_length']
+        tokens_needed = batch_size * context_length + 1
+        # If not enough tokens left in buffer, fetch next buffer
+        if buffer_pointer + tokens_needed > buffer_len:
+            buffer_global_offset, next_tokens_np = tokens_queue.get()
+            buffer_tokens = torch.from_numpy(next_tokens_np).to(device, dtype=torch.long, non_blocking=True)
+            buffer_pointer = 0
+            buffer_len = buffer_tokens.size(0)
+            print(f"[INFO] Switched to new token buffer of {buffer_len:,} tokens.")
+        # Slice out the batch
+        tokens_slice = buffer_tokens[buffer_pointer:buffer_pointer + tokens_needed]
+        x = tokens_slice[:-1].view(batch_size, context_length)
+        y = tokens_slice[1:].view(batch_size, context_length)
+        buffer_pointer += batch_size * context_length
+        global_data_pointer = buffer_global_offset + buffer_pointer
         data_end_time = time.time() if config['profile'] else None
         
         # Forward pass
@@ -720,18 +830,22 @@ def train_loop(config):
                 timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
                 print(f"[{timestamp}] Step {finished_steps}/{total_steps} ({percent:.1f}%): loss={avg_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f}, grad_norm={grad_norm:.4f}{mem_info}")
             
-            # Save best model less frequently (every 500 steps)
-            if avg_loss < best_loss and (step + 1) % 500 == 0:
+            # Save best model if a new best is found, but not more than once every 500 steps
+            if avg_loss < best_loss and (step + 1 - last_best_save_step >= min_best_save_interval):
                 best_loss = avg_loss
+                last_best_save_step = step + 1
                 save_checkpoint(model, optimizer, step, config['checkpoint_path'], 
-                              best_loss=best_loss, additional_metadata={'data_pointer': data_pointer})
+                best_loss=best_loss, additional_metadata={'data_pointer': global_data_pointer})
+
+
                 log(f"Best model saved at step {step + 1} with loss {best_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f} to {config['checkpoint_path']}")
             
             # Periodic checkpoint save every 2000 steps
             if (step + 1) % 2000 == 0:
                 periodic_checkpoint_path = config['checkpoint_path'].replace('.pt', f'_step_{step + 1}.pt')
-                save_checkpoint(model, optimizer, step, periodic_checkpoint_path, 
-                              best_loss=best_loss, additional_metadata={'data_pointer': data_pointer})
+                save_checkpoint(model, optimizer, step, config['checkpoint_path'], 
+                best_loss=best_loss, additional_metadata={'data_pointer': global_data_pointer})
+
                 log(f"Periodic checkpoint saved at step {step + 1} to {periodic_checkpoint_path}")
         
         # PyTorch profiler step

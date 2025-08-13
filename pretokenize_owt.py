@@ -92,7 +92,7 @@ def pretokenize_chunk(args):
         # Remaining lines
         if lines_buffer:
             tokens = tokenizer.encode_iterable(lines_buffer)
-            pickle.dump(tokens, out_f)
+            pickle.dump(list(tokens), out_f)
             batch_bytes = sum(len(line.encode("utf-8")) for line in lines_buffer)
             processed_bytes += batch_bytes
             percent = 100.0 * processed_bytes / total_bytes
@@ -103,7 +103,7 @@ def pretokenize_chunk(args):
             try:
                 chunk = leftover.decode("utf-8")
                 tokens = tokenizer.encode_iterable(chunk.splitlines())
-                pickle.dump(tokens, out_f)
+                pickle.dump(list(tokens), out_f)
                 batch_bytes = len(leftover)
                 processed_bytes += batch_bytes
                 percent = 100.0 * processed_bytes / total_bytes
@@ -128,6 +128,36 @@ def main():
     output_tokens_path = "openwebtext_pretok_tokens.pkl"
     special_token = "<|endoftext|>"
     num_processes = 12
+
+    # Clean up any existing output file before starting
+    if os.path.exists(output_tokens_path):
+        ts(f"Removing existing output file: {output_tokens_path}")
+        os.remove(output_tokens_path)
+
+    # Clean up any existing temp files from previous runs
+    import glob
+    import tempfile as tf
+    
+    # Check current directory
+    temp_files = glob.glob("chunk_*.pkl")
+    if temp_files:
+        ts(f"Removing {len(temp_files)} existing temp files from current directory")
+        for temp_file in temp_files:
+            try:
+                os.remove(temp_file)
+            except FileNotFoundError:
+                pass
+    
+    # Check system temp directory for leftover chunk files
+    temp_dir = tf.gettempdir()
+    temp_files_in_tmp = glob.glob(os.path.join(temp_dir, "**/chunk_*.pkl"), recursive=True)
+    if temp_files_in_tmp:
+        ts(f"Removing {len(temp_files_in_tmp)} existing temp files from system temp directory")
+        for temp_file in temp_files_in_tmp:
+            try:
+                os.remove(temp_file)
+            except (FileNotFoundError, PermissionError):
+                pass
 
     t_start = time.time()
     ts("Finding chunk boundaries...")

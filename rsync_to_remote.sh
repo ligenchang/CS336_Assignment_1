@@ -11,7 +11,7 @@ REMOTE_PATH="/home/ubuntu"
 SSH_KEY="$HOME/.ssh/id_rsa"
 
 # Source paths
-MODEL_CHECKPOINT="/Users/michaelli/Downloads/CS336_Assignment_1/openwebtext_pretok_tokens.pkl"
+MODEL_CHECKPOINT="openwebtext_pretok_tokens.pkl"
 TRAIN_SCRIPT="/Users/michaelli/Documents/CS336_Assignment/train.py"
 CS336_BASICS_DIR="/Users/michaelli/Documents/CS336_Assignment/cs336_basics"
 
