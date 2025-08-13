@@ -197,78 +197,76 @@ def main():
 
     # Tokenize prompt
     prompt_ids = tokenizer.encode(args.prompt)
-    print(f"Prompt tokens: {len(prompt_ids)}")
+    # Fancy streamed output with color and formatting
+    import sys
+    from time import sleep
+    try:
+        from rich.console import Console
+        from rich.text import Text
+        console = Console()
+        use_rich = True
+    except ImportError:
+        use_rich = False
+
     if len(prompt_ids) > context_length:
-        print(f"Warning: Prompt too long ({len(prompt_ids)} tokens), truncating to last {context_length} tokens")
         prompt_ids = prompt_ids[-context_length:]
 
     generated = list(prompt_ids)
-    print(f"Starting generation with prompt: '{args.prompt}'")
-    print(f"Temperature: {args.temperature}, Top-p: {args.top_p}")
-    print("=" * 50)
-    print("\n=== STREAMED OUTPUT ===")
-    print(tokenizer.decode(prompt_ids), end="", flush=True)  # Print prompt first
 
+    # Fancy header
+    header = f"\n\033[1;36m╔{'═'*60}╗\033[0m\n"
+    header += f"\033[1;36m║\033[0m   \033[1mStreaming LLM Output\033[0m   \033[2m(temperature={args.temperature}, top_p={args.top_p})\033[0m\n"
+    header += f"\033[1;36m╚{'═'*60}╝\033[0m\n"
+    prompt_str = tokenizer.decode(prompt_ids)
+    if use_rich:
+        console.print(header, highlight=False)
+        console.print("[bold magenta]Prompt:[/bold magenta]", style="bold magenta", end=" ")
+        console.print(f"[bold white]{prompt_str}[/bold white]", end="", highlight=False)
+        console.print("\n[bold green]Streaming Output:[/bold green]", style="bold green", end=" ", highlight=False)
+    else:
+        print(header, end="")
+        print("\033[1;35mPrompt:\033[0m ", end="")
+        print(f"\033[1;37m{prompt_str}\033[0m", end="", flush=True)
+        print("\n\033[1;32mStreaming Output:\033[0m ", end="", flush=True)
+
+    token_count = 0
     for step in range(args.length):
-        # Prepare input - use only the most recent context_length tokens
         input_ids = generated[-context_length:] if len(generated) > context_length else generated
         x = torch.tensor([input_ids], dtype=torch.long, device=device)
-        
-        # Forward pass through transformer
         with torch.no_grad():
             logits = model(x)
-        
-        # Get logits for the last position (next token prediction)
         next_token_logits = logits[0, len(input_ids)-1].float()
-        
-        # Apply temperature scaling and compute softmax
         probs = softmax_with_temperature(next_token_logits, args.temperature)
-        
-        # Apply top-p (nucleus) sampling
         if args.top_p < 1.0:
             probs = nucleus_sampling(probs, args.top_p)
-        
-        # Sample next token
         if args.temperature == 0.0:
-            # Greedy decoding
             next_token = torch.argmax(probs).item()
         else:
-            # Stochastic sampling
             next_token = torch.multinomial(probs, 1).item()
-        
         generated.append(next_token)
-        
-        # Stream the new token
-        print(tokenizer.decode([next_token]), end="", flush=True)
-        
-        # Stop if we hit end-of-text token
+        token_str = tokenizer.decode([next_token])
+        token_count += 1
+        if use_rich:
+            console.print(token_str, style="bold white", end="", highlight=False)
+        else:
+            print(f"\033[1;37m{token_str}\033[0m", end="", flush=True)
+        sys.stdout.flush()
+        # sleep(0.01)  # Uncomment for dramatic effect
         if eos_token_id is not None and next_token == eos_token_id:
-            print(f"\nGeneration stopped at step {step+1}: <|endoftext|> token generated")
+            if use_rich:
+                console.print(f"\n[bold yellow]⏹️  Generation stopped after {token_count} tokens: <|endoftext|> token generated[/bold yellow]")
+            else:
+                print(f"\n\033[1;33m⏹️  Generation stopped after {token_count} tokens: <|endoftext|> token generated\033[0m")
             break
 
-    # Decode and print results
-    generated_text = tokenizer.decode(generated)
-    prompt_text = tokenizer.decode(prompt_ids)
-    
-    print("\n" + "=" * 50)
-    print("=== GENERATION COMPLETE ===")
-    print("=" * 50)
-    print(f"Total tokens generated: {len(generated) - len(prompt_ids)}")
-    print(f"Total tokens in output: {len(generated)}")
-    print("\n=== PROMPT ===")
-    print(f'"{prompt_text}"')
-    print("\n=== FULL OUTPUT (Prompt + Generated) ===")
-    print(f'"{generated_text}"')
-    
-    # Extract just the generated portion
-    if len(generated) > len(prompt_ids):
-        generated_only = generated[len(prompt_ids):]
-        generated_only_text = tokenizer.decode(generated_only)
-        print("\n=== GENERATED TEXT ONLY ===")
-        print(f'"{generated_only_text}"')
+    # Fancy footer
+    footer = f"\n\033[1;36m╔{'═'*60}╗\033[0m\n"
+    footer += f"\033[1;36m║\033[0m   \033[1m[Generation Complete]\033[0m   \033[2m(Tokens generated: {token_count})\033[0m\n"
+    footer += f"\033[1;36m╚{'═'*60}╝\033[0m\n"
+    if use_rich:
+        console.print(footer, highlight=False)
     else:
-        print("\n=== GENERATED TEXT ONLY ===")
-        print("(No new tokens generated)")
+        print(footer)
 
 if __name__ == "__main__":
     main()
