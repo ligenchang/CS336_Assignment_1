@@ -66,29 +66,6 @@ def checkpointed_transformer_lm(model, in_indices, checkpoint_every_n_layers=4):
 # DATA UTILITIES
 # =============================================================================
 
-def get_batch(tokens, batch_size, context_length, device, data_pointer):
-    """
-    Fully vectorized, GPU-native batch creation for maximum speed.
-    Assumes tokens is a 1D torch tensor on the target device.
-    """
-    max_start = tokens.size(0) - context_length - 1
-    # Compute start indices for each sample in the batch
-    starts = torch.arange(
-        data_pointer, data_pointer + batch_size * context_length, context_length, device='cpu'
-    ) % max_start
-    # For each start, create indices for the context window
-    offsets = torch.arange(context_length, device='cpu')
-    idx = starts.unsqueeze(1) + offsets.unsqueeze(0)  # (batch_size, context_length)
-    idx_y = idx + 1
-    # Move indices to device if needed
-    idx = idx.to(device)
-    idx_y = idx_y.to(device)
-    # Gather input and target sequences
-    x = tokens[idx]
-    y = tokens[idx_y]
-    # Advance data_pointer
-    data_pointer = (data_pointer + batch_size * context_length) % max_start
-    return x, y, data_pointer
 
 
 # =============================================================================
@@ -111,7 +88,7 @@ def get_dataset_defaults(dataset_name):
             'batch_size': 16, # Reasonable for this size
             'num_steps': 160000, # Keep Chinchilla token budget
             'accumulation_steps': 8, # Reasonable for this size
-            'base_lr': 6e-4,  # Standard LR for GPT-2 small
+            'base_lr': 1e-4,  # Standard LR for GPT-2 small
             'min_lr': 1e-5,   # Proportionally lower min LR
             'max_grad_norm': 1.0,
             'rope_theta': 10000
@@ -249,56 +226,6 @@ def init_model(vocab_size, d_model, num_layers, num_heads, d_ff, context_length,
     )
     return model
 
-def init_weights_fn(vocab_size, d_model, num_layers, d_ff, device):
-    """Initialize model weights with proper scaling (legacy function for compatibility)."""
-    weights = {}
-    
-    # Token embeddings
-    emb = torch.empty(vocab_size, d_model, device=device)
-    torch.nn.init.trunc_normal_(emb, mean=0.0, std=1.0, a=-3.0, b=3.0)
-    weights["token_embeddings.weight"] = torch.nn.Parameter(emb, requires_grad=True)
-    
-    # Transformer layers
-    for i in range(num_layers):
-        prefix = f"layers.{i}."
-        
-        # Attention projections
-        for proj in ["attn.q_proj.weight", "attn.k_proj.weight", "attn.v_proj.weight", "attn.output_proj.weight"]:
-            w = torch.empty(d_model, d_model, device=device)
-            std = (2.0 / (d_model + d_model)) ** 0.5
-            torch.nn.init.trunc_normal_(w, mean=0.0, std=std, a=-3*std, b=3*std)
-            weights[prefix + proj] = torch.nn.Parameter(w, requires_grad=True)
-        
-        # Layer norms
-        weights[prefix + "ln1.weight"] = torch.nn.Parameter(torch.ones(d_model, device=device), requires_grad=True)
-        weights[prefix + "ln2.weight"] = torch.nn.Parameter(torch.ones(d_model, device=device), requires_grad=True)
-        
-        # Feed-forward weights
-        w1 = torch.empty(d_ff, d_model, device=device)
-        std1 = (2.0 / (d_ff + d_model)) ** 0.5
-        torch.nn.init.trunc_normal_(w1, mean=0.0, std=std1, a=-3*std1, b=3*std1)
-        weights[prefix + "ffn.w1.weight"] = torch.nn.Parameter(w1, requires_grad=True)
-        
-        w2 = torch.empty(d_model, d_ff, device=device)
-        std2 = (2.0 / (d_model + d_ff)) ** 0.5
-        torch.nn.init.trunc_normal_(w2, mean=0.0, std=std2, a=-3*std2, b=3*std2)
-        weights[prefix + "ffn.w2.weight"] = torch.nn.Parameter(w2, requires_grad=True)
-        
-        w3 = torch.empty(d_ff, d_model, device=device)
-        std3 = (2.0 / (d_ff + d_model)) ** 0.5
-        torch.nn.init.trunc_normal_(w3, mean=0.0, std=std3, a=-3*std3, b=3*std3)
-        weights[prefix + "ffn.w3.weight"] = torch.nn.Parameter(w3, requires_grad=True)
-    
-    # Final layer norm
-    weights["ln_final.weight"] = torch.nn.Parameter(torch.ones(d_model, device=device), requires_grad=True)
-    
-    # Language model head
-    lm_head = torch.empty(vocab_size, d_model, device=device)
-    std_lm = (2.0 / (vocab_size + d_model)) ** 0.5
-    torch.nn.init.trunc_normal_(lm_head, mean=0.0, std=std_lm, a=-3*std_lm, b=3*std_lm)
-    weights["lm_head.weight"] = torch.nn.Parameter(lm_head, requires_grad=True)
-    
-    return weights
 
 
 def setup_gpu_optimization():
