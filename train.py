@@ -78,16 +78,16 @@ def get_dataset_defaults(dataset_name):
             'checkpoint_path': 'openwebtext_transformer_ckpt.pt',
             'curve_path': 'openwebtext_learning_curve.npy',
             'vocab_size': 32000,
-            'context_length': 1024,
-            'd_model': 1024,   # GPT-2 small style
-            'd_ff': 2048,     # GPT-2 small style
-            'num_layers': 24, # GPT-2 small style
-            'num_heads': 16,  # GPT-2 small style
-            'batch_size': 28, # Reasonable for this size
-            'num_steps': 160000, # Keep Chinchilla token budget
-            'accumulation_steps': 8, # Reasonable for this size
-            'base_lr': 3e-4,  # Standard LR for GPT-2 small
-            'min_lr': 1e-5,   # Proportionally lower min LR
+            'context_length': 512,    # Shorter context for lower memory
+            'd_model': 1792,          # Slightly smaller than previous, between GPT-2 Large and GPT-3 Small
+            'd_ff': 7168,             # Slightly smaller FFN
+            'num_layers': 36,         # Slightly fewer layers
+            'num_heads': 28,          # Fewer heads (must divide d_model)
+            'batch_size': 16,         # Keep batch size reasonable for memory
+            'num_steps': 160000,      # Keep Chinchilla token budget
+            'accumulation_steps': 8,  # Reasonable for this size
+            'base_lr': 3e-4,          # Standard LR for GPT-2/3
+            'min_lr': 1e-5,           # Proportionally lower min LR
             'max_grad_norm': 1.0,
             'rope_theta': 10000
         }
@@ -100,10 +100,10 @@ def get_dataset_defaults(dataset_name):
             'vocab_size': 32000,
             'context_length': 1024,
             'd_model': 1024,   # Smaller than GPT-2 Large
-            'd_ff': 2048,      # Smaller FFN
+            'd_ff': 4096,      # Smaller FFN
             'num_layers': 24,  # Fewer layers
             'num_heads': 16,   # Fewer heads
-            'batch_size': 28,   # Smaller batch size
+            'batch_size': 16,   # Smaller batch size
             'num_steps': 160000, # Keep Chinchilla token budget
             'accumulation_steps': 8, # Adjusted for smaller batch
             'base_lr': 3e-4,  # Slightly lower LR
@@ -156,7 +156,7 @@ def parse_args_and_config():
     parser.add_argument('--num_heads', type=int, default=None, help='Override num_heads')
     # MoE options
     parser.add_argument('--use_moe', action='store_true', help='Enable Mixture-of-Experts (MoE) in the transformer FFN')
-    parser.add_argument('--num_experts', type=int, default=8, help='Number of experts in MoE layer (if enabled)')
+    parser.add_argument('--num_experts', type=int, default=4, help='Number of experts in MoE layer (if enabled)')
     parser.add_argument('--top_k', type=int, default=2, help='Number of experts to route each token to (if MoE enabled)')
     
     # Training parameters
@@ -245,10 +245,9 @@ def setup_device():
 # MODEL INITIALIZATION
 # =============================================================================
 
-def init_model(vocab_size, d_model, num_layers, num_heads, d_ff, context_length, rope_theta, device):
+def init_model(vocab_size, d_model, num_layers, num_heads, d_ff, context_length, rope_theta, device, config):
     """Initialize model using the optimized TransformerLM class.
-    MoE support: pass use_moe, num_experts, top_k if present in config.
-    You must update cs336_basics/nn_utils.py to support these arguments!"""
+    MoE support: pass use_moe, num_experts, top_k from config dict."""
     model = TransformerLM(
         vocab_size=vocab_size,
         context_length=context_length,
@@ -259,10 +258,9 @@ def init_model(vocab_size, d_model, num_layers, num_heads, d_ff, context_length,
         rope_theta=rope_theta,
         device=device,
         dtype=torch.float32,
-        # MoE arguments (must be handled in TransformerLM)
-        use_moe=getattr(globals().get('config', {}), 'use_moe', False),
-        num_experts=getattr(globals().get('config', {}), 'num_experts', 4),
-        top_k=getattr(globals().get('config', {}), 'top_k', 2)
+        use_moe=config.get('use_moe', False),
+        num_experts=config.get('num_experts', 4),
+        top_k=config.get('top_k', 2)
     )
     return model
 
@@ -318,7 +316,7 @@ def load_checkpoint_simple(config, device):
     # Always initialize model and optimizer from scratch
     model = init_model(config['vocab_size'], config['d_model'], config['num_layers'], 
                      config['num_heads'], config['d_ff'], config['context_length'], 
-                     config['rope_theta'], device)
+                     config['rope_theta'], device, config)
     optimizer = AdamW(model.parameters(), lr=config['base_lr'], betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
     
     start_step = 0
@@ -525,6 +523,11 @@ def train_loop(config):
     device = setup_device()
     # Load or initialize model and get data_pointer before using it
     model, optimizer, start_step, best_loss, data_pointer = load_checkpoint_simple(config, device)
+    # Offload optimizer states to CPU to save GPU memory
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor) and v.device.type == 'cuda':
+                state[k] = v.cpu()
     # Optionally override data_pointer if requested
     if config.get('force_data_pointer_zero', False):
         print("[INFO] --force_data_pointer_zero specified: Forcing data_pointer to 0 (start from beginning of dataset)")
@@ -543,11 +546,50 @@ def train_loop(config):
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     embedding_params = model.token_embeddings.weight.numel() + model.lm_head.weight.numel()
     non_embedding_params = total_params - embedding_params
-    
+
+    # MoE parameter breakdown (if enabled)
+    moe_params = 0
+    moe_gating_params = 0
+    moe_expert_params = 0
+    moe_layers = 0
+    ffn_params = 0
+    if config.get('use_moe', False):
+        for layer in model.layers:
+            if hasattr(layer, 'use_moe') and layer.use_moe:
+                moe_layers += 1
+                # Gating: d_model x num_experts + num_experts (bias)
+                moe_gating_params += layer.ffn.gate.weight.numel() + layer.ffn.gate.bias.numel()
+                # Experts: num_experts * (d_model*2*d_ff + 2*d_ff + d_ff*d_model + d_model)
+                # (w1, b1, w2, b2)
+                moe_expert_params += (
+                    layer.ffn.w1.numel() + layer.ffn.b1.numel() +
+                    layer.ffn.w2.numel() + layer.ffn.b2.numel()
+                )
+            else:
+                # Dense FFN (SwiGLU): w1, w2, w3
+                if hasattr(layer.ffn, 'w1') and hasattr(layer.ffn, 'w2') and hasattr(layer.ffn, 'w3'):
+                    ffn_params += layer.ffn.w1.weight.numel() + layer.ffn.w2.weight.numel() + layer.ffn.w3.weight.numel()
+    else:
+        # All dense FFN (SwiGLU)
+        for layer in model.layers:
+            if hasattr(layer.ffn, 'w1') and hasattr(layer.ffn, 'w2') and hasattr(layer.ffn, 'w3'):
+                ffn_params += layer.ffn.w1.weight.numel() + layer.ffn.w2.weight.numel() + layer.ffn.w3.weight.numel()
+
+    moe_params = moe_gating_params + moe_expert_params
+
     print(f"[INFO] Model parameter breakdown:")
     print(f"  Total parameters: {total_params:,}")
     print(f"  Embedding parameters (token + lm_head): {embedding_params:,}")
     print(f"  Non-embedding parameters: {non_embedding_params:,}")
+    if config.get('use_moe', False):
+        print(f"  MoE layers: {moe_layers}")
+        print(f"    MoE gating parameters: {moe_gating_params:,}")
+        print(f"    MoE expert parameters: {moe_expert_params:,}")
+        print(f"    MoE total (gating + experts): {moe_params:,}")
+        if ffn_params > 0:
+            print(f"    Dense FFN parameters (SwiGLU, non-MoE layers): {ffn_params:,}")
+    else:
+        print(f"  Dense FFN parameters (SwiGLU): {ffn_params:,}")
     # # Load total number of tokens in the dataset for Chinchilla analysis
     # try:
     #     from tqdm import tqdm
@@ -645,6 +687,9 @@ def train_loop(config):
     force_save_done = False
     progress_log_counter = 0
     for step in range(start_step, config['num_steps']):
+        # Regularly clear CUDA cache to help with memory fragmentation
+        if torch.cuda.is_available() and step % 100 == 0:
+            torch.cuda.empty_cache()
         step_start_time = time.time() if config['profile'] else None
 
         # Use constant lr for first 90%, then linearly decay to min_lr in last 10%

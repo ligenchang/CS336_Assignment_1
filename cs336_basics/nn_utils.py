@@ -10,7 +10,7 @@ from torch import nn
 
 
 class MoELayer(nn.Module):
-    def __init__(self, d_model, d_ff, num_experts=4, top_k=2, capacity_factor=1.25):
+    def __init__(self, d_model, d_ff, num_experts=4, top_k=2, capacity_factor=1.25, device=None, dtype=None):
         super().__init__()
         self.d_model = d_model
         self.d_ff = d_ff
@@ -19,16 +19,16 @@ class MoELayer(nn.Module):
         self.capacity_factor = capacity_factor
 
         # Gating network
-        self.gate = nn.Linear(d_model, num_experts)
+        self.gate = nn.Linear(d_model, num_experts, device=device, dtype=dtype)
 
         # Expert parameters
-        self.w1 = nn.Parameter(torch.empty(num_experts, d_model, 2*d_ff))
-        self.b1 = nn.Parameter(torch.zeros(num_experts, 2*d_ff))
-        self.w2 = nn.Parameter(torch.empty(num_experts, d_ff, d_model))
-        self.b2 = nn.Parameter(torch.zeros(num_experts, d_model))
+        self.w1 = nn.Parameter(torch.empty(num_experts, d_model, 2*d_ff, device=device, dtype=dtype))
+        self.b1 = nn.Parameter(torch.zeros(num_experts, 2*d_ff, device=device, dtype=dtype))
+        self.w2 = nn.Parameter(torch.empty(num_experts, d_ff, d_model, device=device, dtype=dtype))
+        self.b2 = nn.Parameter(torch.zeros(num_experts, d_model, device=device, dtype=dtype))
 
         self.reset_parameters()
-        self.load_balance_loss = torch.tensor(0.0)
+        self.load_balance_loss = torch.tensor(0.0, device=device, dtype=dtype)
 
     def reset_parameters(self):
         nn.init.uniform_(self.w1, -1.0 / self.d_model**0.5, 1.0 / self.d_model**0.5)
