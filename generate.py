@@ -95,7 +95,7 @@ def main():
 
     # Dataset-specific defaults - match train.py exactly
     if args.dataset == 'owt':
-        default_ckpt = 'openwebtext_transformer_ckpt_step_28000.pt'
+        default_ckpt = 'wikipedia_transformer_ckpt.pt'
         default_vocab = 'owt_bpe_vocab.pkl'
         default_merges = 'owt_bpe_merges.pkl'
         default_num_heads = 12  # From train.py OWT config

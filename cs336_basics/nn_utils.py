@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -5,6 +6,108 @@ from typing import Iterable, Union, Optional, Tuple
 from collections.abc import Iterable as IterableABC
 import math
 from einops import rearrange, einsum
+from torch import nn
+
+
+class MoELayer(nn.Module):
+    def __init__(self, d_model, d_ff, num_experts=4, top_k=2, capacity_factor=1.25):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.capacity_factor = capacity_factor
+
+        # Gating network
+        self.gate = nn.Linear(d_model, num_experts)
+
+        # Expert parameters
+        self.w1 = nn.Parameter(torch.empty(num_experts, d_model, 2*d_ff))
+        self.b1 = nn.Parameter(torch.zeros(num_experts, 2*d_ff))
+        self.w2 = nn.Parameter(torch.empty(num_experts, d_ff, d_model))
+        self.b2 = nn.Parameter(torch.zeros(num_experts, d_model))
+
+        self.reset_parameters()
+        self.load_balance_loss = torch.tensor(0.0)
+
+    def reset_parameters(self):
+        nn.init.uniform_(self.w1, -1.0 / self.d_model**0.5, 1.0 / self.d_model**0.5)
+        nn.init.uniform_(self.w2, -1.0 / self.d_ff**0.5, 1.0 / self.d_ff**0.5)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+
+    def forward(self, x):
+        B, S, D = x.shape
+        N = B * S
+        device = x.device
+        dtype = x.dtype
+        x_flat = x.reshape(N, D)
+
+        # --- Gating ---
+        logits = self.gate(x_flat)                   # (N, E)
+        probs = F.softmax(logits, dim=-1)           # (N, E)
+        topk_scores, topk_idx = torch.topk(probs, self.top_k, dim=-1)  # (N, K)
+        topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-9)
+
+        # Efficient top-k >1 support: avoid unnecessary flattening and sorting
+        # token_idx_flat: (N, K) -> (N*K,)
+        # expert_idx_flat: (N, K) -> (N*K,)
+        # gate_flat: (N, K) -> (N*K, 1)
+        # x_selected: (N*K, D)
+        token_idx = torch.arange(N, device=device).unsqueeze(1).expand(N, self.top_k)
+        token_idx_flat = token_idx.reshape(-1)
+        expert_idx_flat = topk_idx.reshape(-1)
+        gate_flat = topk_scores.reshape(-1, 1)
+        x_selected = x_flat[token_idx_flat]
+
+
+        # --- Capacity mask (vectorized, bincount/cumsum per expert, no sort) ---
+        M = expert_idx_flat.size(0)
+        # Compute how many tokens are assigned to each expert (for max_capacity)
+        expert_counts = torch.bincount(expert_idx_flat, minlength=self.num_experts)
+        max_capacity = (self.capacity_factor * expert_counts).ceil().to(torch.long)
+
+        # Compute position in expert for each token (no sort, O(M+E))
+        # For each expert, assign a running counter to each token assigned to it
+        pos_in_expert = torch.zeros(M, device=device, dtype=torch.long)
+        # For each expert, fill in positions for its tokens
+        # 1. Get indices for each expert
+        for e in range(self.num_experts):
+            idx = (expert_idx_flat == e).nonzero(as_tuple=True)[0]
+            if idx.numel() > 0:
+                pos_in_expert[idx] = torch.arange(idx.numel(), device=device)
+        keep = pos_in_expert < max_capacity[expert_idx_flat]
+
+        token_idx_flat = token_idx_flat[keep]
+        expert_idx_flat = expert_idx_flat[keep]
+        gate_flat = gate_flat[keep]
+        x_selected = x_selected[keep]
+
+            # --- Batched expert MLP ---
+        # Gather weights for each token's expert
+        w1 = self.w1[expert_idx_flat]  # (M, D, 2*d_ff)
+        b1 = self.b1[expert_idx_flat]  # (M, 2*d_ff)
+        w2 = self.w2[expert_idx_flat]  # (M, d_ff, D)
+        b2 = self.b2[expert_idx_flat]  # (M, D)
+
+        # Preallocate expert output buffer
+        y = torch.empty((x_selected.shape[0], D), device=device, dtype=dtype)
+        # Use torch.einsum for efficiency
+        h = torch.einsum('md,mdh->mh', x_selected, w1) + b1  # (M, 2*d_ff)
+        a, b = h.chunk(2, dim=-1)
+        h = F.silu(a) * b
+        y.copy_(torch.einsum('mf,mfd->md', h, w2) + b2)  # (M, D)
+        y.mul_(gate_flat)
+
+        # --- Aggregate outputs (single index_add_) ---
+        out = torch.zeros(N, D, device=device, dtype=dtype)
+        out.index_add_(0, token_idx_flat, y)
+
+        # --- Load balance loss ---
+        expert_usage = probs.mean(dim=0)
+        self.load_balance_loss = (expert_usage * (expert_usage.add(1e-9)).log()).sum()
+
+        return out.view(B, S, D).to(dtype)
 
 def softmax(in_features: Tensor, dim: int) -> Tensor:
     """
@@ -664,19 +767,24 @@ class TransformerBlock(torch.nn.Module):
     """
     A single pre-norm transformer block with RoPE and pre-initialized modules.
     """
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float, device=None, dtype=None):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float, device=None, dtype=None, use_moe=False, num_experts=4, top_k=2):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_ff = d_ff
         self.max_seq_len = max_seq_len
         self.theta = theta
-        
+        self.use_moe = use_moe
+        self.num_experts = num_experts
+        self.top_k = top_k
         # Pre-initialize modules
         self.ln1 = RMSNorm(d_model, 1e-5, device=device, dtype=dtype)
         self.attn = MultiHeadSelfAttentionWithRoPE(d_model, num_heads, max_seq_len, theta, device=device, dtype=dtype)
         self.ln2 = RMSNorm(d_model, 1e-5, device=device, dtype=dtype)
-        self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+        if use_moe:
+            self.ffn = MoELayer(d_model, d_ff, num_experts=num_experts, top_k=top_k, device=device, dtype=dtype)
+        else:
+            self.ffn = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
     
     def forward(self, in_features: torch.Tensor) -> torch.Tensor:
         """
@@ -704,12 +812,16 @@ class TransformerBlock(torch.nn.Module):
         # Second LayerNorm (pre-norm for FFN)
         normed_res1 = self.ln2(res1)
         
-        # Feed-forward network with SwiGLU
-        ffn_output = self.ffn(normed_res1)
-        
+        # Feed-forward network (SwiGLU or MoE)
+        if self.use_moe:
+            ffn_output = self.ffn(normed_res1)
+            # Optionally, you can return the load balancing loss for aggregation
+            self.moe_loss = self.ffn.load_balance_loss
+        else:
+            ffn_output = self.ffn(normed_res1)
+            self.moe_loss = 0.0
         # Final residual connection
         output = res1 + ffn_output
-        
         return output
 
 def transformer_block(
@@ -799,7 +911,8 @@ class TransformerLM(torch.nn.Module):
     A complete transformer language model with pre-initialized modules.
     """
     def __init__(self, vocab_size: int, context_length: int, d_model: int, num_layers: int, 
-                 num_heads: int, d_ff: int, rope_theta: float, device=None, dtype=None):
+                 num_heads: int, d_ff: int, rope_theta: float, device=None, dtype=None,
+                 use_moe=False, num_experts=4, top_k=2):
         super().__init__()
         self.vocab_size = vocab_size
         self.context_length = context_length
@@ -808,11 +921,14 @@ class TransformerLM(torch.nn.Module):
         self.num_heads = num_heads
         self.d_ff = d_ff
         self.rope_theta = rope_theta
-        
+        self.use_moe = use_moe
+        self.num_experts = num_experts
+        self.top_k = top_k
         # Pre-initialize all modules
         self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
         self.layers = torch.nn.ModuleList([
-            TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta, device=device, dtype=dtype)
+            TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta, device=device, dtype=dtype,
+                             use_moe=use_moe, num_experts=num_experts, top_k=top_k)
             for _ in range(num_layers)
         ])
         self.ln_final = RMSNorm(d_model, 1e-5, device=device, dtype=dtype)
@@ -821,24 +937,25 @@ class TransformerLM(torch.nn.Module):
     def forward(self, in_indices: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for transformer language model.
-        
-        Args:
-            in_indices (torch.Tensor): The input token indices of shape (batch_size, seq_len).
-            
-        Returns:
-            torch.Tensor: The output logits of shape (batch_size, seq_len, vocab_size).
+        Returns logits. If MoE is used, you can access the total MoE loss via self.get_moe_loss().
         """
         # Embedding
         x = self.token_embeddings(in_indices)
-        
         # Process through transformer layers
+        self._moe_losses = []
         for layer in self.layers:
             x = layer(x)
-        
+            # Collect MoE loss if present
+            if hasattr(layer, 'moe_loss'):
+                self._moe_losses.append(layer.moe_loss)
         # Final layer norm
         x = self.ln_final(x)
-        
         # Language model head
         logits = self.lm_head(x)
-        
         return logits
+
+    def get_moe_loss(self):
+        """Return the sum of MoE auxiliary losses (for load balancing)."""
+        if hasattr(self, '_moe_losses') and self._moe_losses:
+            return sum(self._moe_losses)
+        return 0.0

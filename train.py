@@ -6,14 +6,12 @@ with support for gradient checkpointing and multiple datasets.
 """
 
 import os
-import io
 import time
 import argparse
 import torch
 import numpy as np
 import pickle
 
-from cs336_basics.tokenizer import Tokenizer
 from cs336_basics.nn_utils import cross_entropy, TransformerLM
 from cs336_basics.optimizer import AdamW
 from cs336_basics.lr_scheduler import get_lr_cosine_schedule
@@ -87,8 +85,28 @@ def get_dataset_defaults(dataset_name):
             'num_heads': 12,  # GPT-2 small style
             'batch_size': 16, # Reasonable for this size
             'num_steps': 160000, # Keep Chinchilla token budget
-            'accumulation_steps': 8, # Reasonable for this size
-            'base_lr': 1e-4,  # Standard LR for GPT-2 small
+            'accumulation_steps': 24, # Reasonable for this size
+            'base_lr': 2e-5,  # Standard LR for GPT-2 small
+            'min_lr': 1e-5,   # Proportionally lower min LR
+            'max_grad_norm': 1.0,
+            'rope_theta': 10000
+        }
+    
+    elif dataset_name == 'wiki':
+        return {
+            'tokens_path': 'wikipedia_pretok_tokens.pkl',
+            'checkpoint_path': 'wikipedia_transformer_ckpt.pt',
+            'curve_path': 'wikipedia_learning_curve.npy',
+            'vocab_size': 32000,
+            'context_length': 1024,
+            'd_model': 1024,   # Smaller than GPT-2 Large
+            'd_ff': 2048,      # Smaller FFN
+            'num_layers': 24,  # Fewer layers
+            'num_heads': 16,   # Fewer heads
+            'batch_size': 28,   # Smaller batch size
+            'num_steps': 160000, # Keep Chinchilla token budget
+            'accumulation_steps': 8, # Adjusted for smaller batch
+            'base_lr': 3e-4,  # Slightly lower LR
             'min_lr': 1e-5,   # Proportionally lower min LR
             'max_grad_norm': 1.0,
             'rope_theta': 10000
@@ -121,7 +139,7 @@ def parse_args_and_config():
     parser = argparse.ArgumentParser(description='Train Transformer LM on OpenWebText or TinyStories')
     
     # Dataset selection
-    parser.add_argument('--dataset', type=str, default='owt', choices=['owt', 'tinystories'], 
+    parser.add_argument('--dataset', type=str, default='owt', choices=['owt', 'tinystories', "wiki"], 
                        help='Dataset to use: owt or tinystories')
     
     # File paths
@@ -136,6 +154,10 @@ def parse_args_and_config():
     parser.add_argument('--d_ff', type=int, default=None, help='Override d_ff')
     parser.add_argument('--num_layers', type=int, default=None, help='Override num_layers')
     parser.add_argument('--num_heads', type=int, default=None, help='Override num_heads')
+    # MoE options
+    parser.add_argument('--use_moe', action='store_true', help='Enable Mixture-of-Experts (MoE) in the transformer FFN')
+    parser.add_argument('--num_experts', type=int, default=8, help='Number of experts in MoE layer (if enabled)')
+    parser.add_argument('--top_k', type=int, default=2, help='Number of experts to route each token to (if MoE enabled)')
     
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=None, help='Override batch size')
@@ -162,6 +184,12 @@ def parse_args_and_config():
                        help='Enable PyTorch model compilation for better performance')
     parser.add_argument('--auto_batch_size', action='store_true', 
                        help='Automatically find optimal batch size for available GPU memory')
+    # Forced checkpoint save
+    parser.add_argument('--force_save_once', action='store_true',
+                       help='Force a one-time model checkpoint save at the next opportunity')
+    # Force data_pointer to 0 (start from beginning of dataset)
+    parser.add_argument('--force_data_pointer_zero', action='store_true',
+                       help='Force data_pointer to 0 (start from beginning of dataset, ignore checkpoint offset)')
     
     args = parser.parse_args()
     
@@ -191,7 +219,13 @@ def parse_args_and_config():
         'profile': args.profile,
         'torch_profiler': args.torch_profiler,
         'compile_model': args.compile_model,
-        'auto_batch_size': args.auto_batch_size
+        'auto_batch_size': args.auto_batch_size,
+        'force_save_once': args.force_save_once,
+        'force_data_pointer_zero': args.force_data_pointer_zero,
+        # MoE config
+        'use_moe': args.use_moe,
+        'num_experts': args.num_experts,
+        'top_k': args.top_k
     }
     
     return config
@@ -212,7 +246,9 @@ def setup_device():
 # =============================================================================
 
 def init_model(vocab_size, d_model, num_layers, num_heads, d_ff, context_length, rope_theta, device):
-    """Initialize model using the optimized TransformerLM class."""
+    """Initialize model using the optimized TransformerLM class.
+    MoE support: pass use_moe, num_experts, top_k if present in config.
+    You must update cs336_basics/nn_utils.py to support these arguments!"""
     model = TransformerLM(
         vocab_size=vocab_size,
         context_length=context_length,
@@ -222,7 +258,11 @@ def init_model(vocab_size, d_model, num_layers, num_heads, d_ff, context_length,
         d_ff=d_ff,
         rope_theta=rope_theta,
         device=device,
-        dtype=torch.float32
+        dtype=torch.float32,
+        # MoE arguments (must be handled in TransformerLM)
+        use_moe=getattr(globals().get('config', {}), 'use_moe', False),
+        num_experts=getattr(globals().get('config', {}), 'num_experts', 4),
+        top_k=getattr(globals().get('config', {}), 'top_k', 2)
     )
     return model
 
@@ -267,55 +307,6 @@ def get_gpu_memory_info():
     return "GPU: Not available"
 
 
-def find_optimal_batch_size(model, config, device, tokens):
-    """Find the largest batch size that fits in GPU memory."""
-    if not config.get('auto_batch_size', False):
-        return config['batch_size']
-    
-    print("Finding optimal batch size for available GPU memory...")
-    original_batch_size = config['batch_size']
-    
-    # Start with a small batch size and increase
-    test_batch_size = 4
-    max_batch_size = original_batch_size
-    
-    while test_batch_size <= 64:  # Reasonable upper limit
-        try:
-            torch.cuda.empty_cache()
-            
-            # Test forward and backward pass with this batch size
-            x = torch.randint(0, config['vocab_size'], (test_batch_size, config['context_length']), device=device)
-            y = torch.randint(0, config['vocab_size'], (test_batch_size, config['context_length']), device=device)
-            
-            # Forward pass
-            if config['use_gradient_checkpointing']:
-                logits = checkpointed_transformer_lm(
-                    model=model, in_indices=x, 
-                    checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
-            else:
-                logits = model(x)
-            
-            # Loss and backward pass
-            from cs336_basics.nn_utils import cross_entropy
-            loss = cross_entropy(logits.view(-1, config['vocab_size']), y.view(-1))
-            loss.backward()
-            model.zero_grad()
-            
-            # If we get here without OOM, this batch size works
-            max_batch_size = test_batch_size
-            print(f"Batch size {test_batch_size} fits in memory")
-            test_batch_size += 4
-            
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                print(f"Batch size {test_batch_size} causes OOM, stopping at {max_batch_size}")
-                break
-            else:
-                raise e
-    
-    torch.cuda.empty_cache()
-    print(f"Optimal batch size found: {max_batch_size} (original: {original_batch_size})")
-    return max_batch_size
 
 
 # =============================================================================
@@ -510,8 +501,9 @@ def train_loop(config):
         def loader():
             print(f"[DEBUG] prefetch_tokens.loader: starting from start_offset={start_offset}")
             buf = []
-            total_tokens = 0
-            next_log = 100_000_000
+            # If resuming from checkpoint, start_offset is the number of tokens already processed
+            total_tokens = start_offset
+            next_log = ((total_tokens // 100_000_000) + 1) * 100_000_000
             global_offset = start_offset
             for token in token_stream(tokens_path, start_offset=start_offset):
                 buf.append(token)
@@ -533,9 +525,10 @@ def train_loop(config):
     device = setup_device()
     # Load or initialize model and get data_pointer before using it
     model, optimizer, start_step, best_loss, data_pointer = load_checkpoint_simple(config, device)
-    # TEMP: Hardcode data_pointer for debugging/resume
-    # data_pointer = 400_000_000
-    # print(f"[DEBUG] Overriding data_pointer: stream will start from token {data_pointer}")
+    # Optionally override data_pointer if requested
+    if config.get('force_data_pointer_zero', False):
+        print("[INFO] --force_data_pointer_zero specified: Forcing data_pointer to 0 (start from beginning of dataset)")
+        data_pointer = 0
     start_offset = data_pointer
     tokens_queue = prefetch_tokens(config['tokens_path'], start_offset=start_offset)
     buffer_global_offset, tokens_np = tokens_queue.get()
@@ -544,6 +537,7 @@ def train_loop(config):
     buffer_pointer = start_offset - buffer_global_offset  # position inside buffer
     buffer_len = buffer_tokens.size(0)
     model = model.to(device)
+    model = model.to(torch.bfloat16)
     
     # Calculate and log parameter counts for Chinchilla compliance
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -597,21 +591,6 @@ def train_loop(config):
     else:
         print(f"  ⚠️  Model is overtrained (too many parameters)")
     
-    # Find optimal batch size if requested
-    if config.get('auto_batch_size', False):
-        optimal_batch_size = find_optimal_batch_size(model, config, device, buffer_tokens)
-        if optimal_batch_size != config['batch_size']:
-            # Adjust accumulation steps to maintain similar effective batch size
-            effective_batch_size = config['batch_size'] * config['accumulation_steps']
-            new_accumulation_steps = max(1, effective_batch_size // optimal_batch_size)
-            
-            print(f"Adjusting batch size from {config['batch_size']} to {optimal_batch_size}")
-            print(f"Adjusting accumulation steps from {config['accumulation_steps']} to {new_accumulation_steps}")
-            print(f"Effective batch size: {optimal_batch_size * new_accumulation_steps} (was {effective_batch_size})")
-            
-            config['batch_size'] = optimal_batch_size
-            config['accumulation_steps'] = new_accumulation_steps
-    
     # Compile model if requested
     model = compile_model_if_requested(model, config)
 
@@ -662,7 +641,9 @@ def train_loop(config):
     # buffer_tokens is already set above
     # buffer_pointer and buffer_len are already set above
     last_best_save_step = -500  # So first possible save is at step 0
-    min_best_save_interval = 500
+    min_best_save_interval = 1000
+    force_save_done = False
+    progress_log_counter = 0
     for step in range(start_step, config['num_steps']):
         step_start_time = time.time() if config['profile'] else None
 
@@ -708,6 +689,11 @@ def train_loop(config):
         loss = cross_entropy(logits.view(-1, config['vocab_size']), y.view(-1))
         z_loss = 1e-4 * torch.mean(torch.logsumexp(logits, dim=-1))
         loss = loss + z_loss
+        # Add MoE auxiliary loss if enabled
+        if config.get('use_moe', False) and hasattr(model, 'get_moe_loss'):
+            moe_loss = model.get_moe_loss()
+            # Weight for auxiliary loss can be tuned; 0.01 is a common default
+            loss = loss + 0.01 * moe_loss
         loss = loss / config['accumulation_steps']
         loss_end_time = time.time() if config['profile'] else None
         
@@ -748,8 +734,9 @@ def train_loop(config):
                 log(f"  Optimizer: {optimizer_time:.3f}s ({(optimizer_time/step_total_time*100) if step_total_time else 0:.1f}%)")
                 log(f"  Total step time: {step_total_time:.3f}s")
             
-            # Progress logging every 20 steps
-            if (step + 1) % 20 == 0 or (step + 1) == config['num_steps']:
+            # Progress logging every 72 optimizer steps since this run started
+            progress_log_counter += 1
+            if progress_log_counter % 3 == 0 or (step + 1) == config['num_steps']:
                 total_steps = config['num_steps']
                 finished_steps = step + 1
                 percent = 100.0 * finished_steps / max(1, total_steps)
@@ -757,23 +744,32 @@ def train_loop(config):
                 timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
                 print(f"[{timestamp}] Step {finished_steps}/{total_steps} ({percent:.1f}%): loss={avg_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f}, grad_norm={grad_norm:.4f}{mem_info}")
             
+       
+
             # Save best model if a new best is found, but not more than once every 500 steps
             if avg_loss < best_loss and (step + 1 - last_best_save_step >= min_best_save_interval):
                 best_loss = avg_loss
                 last_best_save_step = step + 1
                 save_checkpoint(model, optimizer, step, config['checkpoint_path'], 
-                best_loss=best_loss, additional_metadata={'data_pointer': global_data_pointer})
-
-
+                    best_loss=best_loss, additional_metadata={'data_pointer': global_data_pointer})
                 log(f"Best model saved at step {step + 1} with loss {best_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f} to {config['checkpoint_path']}")
-            
-            # Periodic checkpoint save every 2000 steps
-            if (step + 1) % 2000 == 0:
-                periodic_checkpoint_path = config['checkpoint_path'].replace('.pt', f'_step_{step + 1}.pt')
-                save_checkpoint(model, optimizer, step, config['checkpoint_path'], 
-                best_loss=best_loss, additional_metadata={'data_pointer': global_data_pointer})
 
+            # Periodic checkpoint save every 72 optimizer steps since this run started
+            if progress_log_counter % 300 == 0:
+                periodic_checkpoint_path = config['checkpoint_path'].replace('.pt', f'_step_backup.pt')
+                save_checkpoint(model, optimizer, step, periodic_checkpoint_path, 
+                    best_loss=avg_loss, additional_metadata={'data_pointer': global_data_pointer})
                 log(f"Periodic checkpoint saved at step {step + 1} to {periodic_checkpoint_path}")
+
+            # Force save one-time model checkpoint if requested
+            if config.get('force_save_once', False) and not force_save_done:
+                best_loss = avg_loss
+                force_save_path = config['checkpoint_path']
+                save_checkpoint(model, optimizer, step, force_save_path,
+                    best_loss=avg_loss, additional_metadata={'data_pointer': global_data_pointer})
+                log(f"Force-saved model at step {step + 1} to {force_save_path}")
+                log(f"Latest best_loss after force save: {avg_loss:.4f}")
+                force_save_done = True
         
         # PyTorch profiler step
         if profiler is not None:
