@@ -79,14 +79,14 @@ def get_dataset_defaults(dataset_name):
             'curve_path': 'openwebtext_learning_curve.npy',
             'vocab_size': 32000,
             'context_length': 1024,
-            'd_model': 768,   # GPT-2 small style
-            'd_ff': 3072,     # GPT-2 small style
-            'num_layers': 12, # GPT-2 small style
-            'num_heads': 12,  # GPT-2 small style
-            'batch_size': 16, # Reasonable for this size
+            'd_model': 1024,   # GPT-2 small style
+            'd_ff': 2048,     # GPT-2 small style
+            'num_layers': 24, # GPT-2 small style
+            'num_heads': 16,  # GPT-2 small style
+            'batch_size': 28, # Reasonable for this size
             'num_steps': 160000, # Keep Chinchilla token budget
-            'accumulation_steps': 24, # Reasonable for this size
-            'base_lr': 2e-5,  # Standard LR for GPT-2 small
+            'accumulation_steps': 8, # Reasonable for this size
+            'base_lr': 3e-4,  # Standard LR for GPT-2 small
             'min_lr': 1e-5,   # Proportionally lower min LR
             'max_grad_norm': 1.0,
             'rope_theta': 10000
