@@ -25,7 +25,6 @@ from .nn_utils import (
     RMSNorm,
     RotaryPositionalEmbedding,
     multihead_self_attention, 
-    multihead_self_attention_with_rope,
     swiglu,
     transformer_block,
     TransformerLM,

@@ -3,6 +3,8 @@ import numpy
 import torch
 import torch.nn.functional as F
 
+from cs336_basics.nn_utils import MultiHeadSelfAttentionWithRoPE
+
 from .adapters import (
     run_multihead_self_attention_with_rope,
     run_rope,
@@ -131,18 +133,12 @@ def test_multihead_self_attention_with_rope(
     # reference_weights = torch.load(FIXTURES_PATH / "unbatched_multihead_self_attention_weights.pt")
     # expected_output = torch.load(FIXTURES_PATH / "unbatched_multihead_self_attention_expected_output.pt")
     pos_ids = rearrange(pos_ids, "seq -> 1 seq")
-    actual_output = run_multihead_self_attention_with_rope(
-        d_model=d_model,
-        num_heads=n_heads,
-        max_seq_len=n_keys,
-        theta=theta,
-        q_proj_weight=q_proj_weight,
-        k_proj_weight=k_proj_weight,
-        v_proj_weight=v_proj_weight,
-        o_proj_weight=o_proj_weight,
-        in_features=in_embeddings,
-        token_positions=pos_ids,
-    )
+    attn = MultiHeadSelfAttentionWithRoPE(d_model, n_heads, n_keys, theta, device=in_embeddings.device, dtype=in_embeddings.dtype)
+    attn.q_proj.weight.data.copy_(q_proj_weight)
+    attn.k_proj.weight.data.copy_(k_proj_weight)
+    attn.v_proj.weight.data.copy_(v_proj_weight)
+    attn.output_proj.weight.data.copy_(o_proj_weight)
+    actual_output = attn(in_embeddings, token_positions=pos_ids)
     # numpy.testing.assert_allclose(actual_output.detach().numpy(), expected_output.detach().numpy(), atol=1e-6)
     numpy_snapshot.assert_match(actual_output, atol=1e-6)
 

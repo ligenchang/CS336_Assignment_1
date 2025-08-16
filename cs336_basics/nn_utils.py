@@ -373,9 +373,9 @@ class MultiHeadSelfAttention(torch.nn.Module):
         v = self.v_proj(in_features)
         
         # Reshape for multi-head attention: [batch_size, seq_len, d_model] -> [batch_size, num_heads, seq_len, head_dim]
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         
         if use_flash and hasattr(F, 'scaled_dot_product_attention'):
             # Use PyTorch's optimized scaled_dot_product_attention with causal mask
@@ -446,34 +446,17 @@ def multihead_self_attention(
     v = einsum(in_features, v_proj_weight, '... d_in, d_out d_in -> ... d_out')
     
     # Reshape for multi-head attention: [batch_size, seq_len, d_model] -> [batch_size, num_heads, seq_len, head_dim]
-    q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
-    k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
-    v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+    q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+    k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+    v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
     
-    if use_flash and hasattr(F, 'scaled_dot_product_attention'):
-        # Use PyTorch's optimized scaled_dot_product_attention with causal mask
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=True  # This handles the causal masking efficiently
-        )
-    else:
-        # Fallback to manual implementation
-        # Create causal mask to prevent attending to future tokens
-        # Shape: [seq_len, seq_len]
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=in_features.device)).bool()
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
-        
-        # Apply scaled dot-product attention with causal mask
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-        scores = scores.masked_fill(~causal_mask, -1e9)  # Apply causal mask
-        
-        # Apply softmax to get attention weights
-        attn_weights = softmax(scores, dim=-1)
-        
-        # Apply attention weights to values
-        attn_output = torch.matmul(attn_weights, v)
+    # Use PyTorch's optimized scaled_dot_product_attention with causal mask
+    attn_output = F.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=True  # This handles the causal masking efficiently
+    )
     
     # Reshape back: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, d_model]
     attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
@@ -525,42 +508,33 @@ class MultiHeadSelfAttentionWithRoPE(torch.nn.Module):
         v = self.v_proj(in_features)
         
         # Reshape for multi-head attention: [batch_size, seq_len, d_model] -> [batch_size, num_heads, seq_len, head_dim]
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         
         # Handle token positions for RoPE
         if token_positions is None:
             token_positions = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
         
-        # Apply RoPE to queries and keys for each head
-        for i in range(self.num_heads):
-            q[:, i] = self.rope_module(q[:, i], token_positions)
-            k[:, i] = self.rope_module(k[:, i], token_positions)
+        # Vectorized RoPE: apply to all heads at once for better GPU utilization
+        # q, k: [batch_size, num_heads, seq_len, head_dim]
+        b, h, s, d = q.shape
+        q = q.contiguous().reshape(b * h, s, d)
+        k = k.contiguous().reshape(b * h, s, d)
+        # Expand token_positions for all heads in the batch
+        token_pos_expanded = token_positions.unsqueeze(1).expand(b, h, s).reshape(b * h, s)
+        q = self.rope_module(q, token_pos_expanded)
+        k = self.rope_module(k, token_pos_expanded)
+        q = q.contiguous().reshape(b, h, s, d)
+        k = k.contiguous().reshape(b, h, s, d)
         
-        if use_flash and hasattr(F, 'scaled_dot_product_attention'):
-            # Use PyTorch's optimized scaled_dot_product_attention with causal mask
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=True  # This handles the causal masking efficiently
-            )
-        else:
-            # Fallback to manual implementation
-            # Create causal mask to prevent attending to future tokens
-            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).bool()
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
-            
-            # Apply scaled dot-product attention with causal mask
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores = scores.masked_fill(~causal_mask, -1e9)  # Apply causal mask
-            
-            # Apply softmax to get attention weights
-            attn_weights = softmax(scores, dim=-1)
-            
-            # Apply attention weights to values
-            attn_output = torch.matmul(attn_weights, v)
+        # Use PyTorch's optimized scaled_dot_product_attention with causal mask
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True  # This handles the causal masking efficiently
+        )
         
         # Reshape back: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, d_model]
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
@@ -570,94 +544,6 @@ class MultiHeadSelfAttentionWithRoPE(torch.nn.Module):
         
         return output
 
-def multihead_self_attention_with_rope(
-    d_model: int,
-    num_heads: int,
-    max_seq_len: int,
-    theta: float,
-    q_proj_weight: Tensor,
-    k_proj_weight: Tensor,
-    v_proj_weight: Tensor,
-    o_proj_weight: Tensor,
-    in_features: Tensor,
-    token_positions: Tensor = None,
-    use_flash: bool = True
-) -> Tensor:
-    """
-    Implements multi-head self-attention with Rotary Position Embedding (RoPE).
-    
-    Args:
-        d_model (int): Dimensionality of the model.
-        num_heads (int): Number of attention heads.
-        max_seq_len (int): Maximum sequence length.
-        theta (float): Base value for RoPE frequency computation.
-        q_proj_weight (Tensor): Query projection weights.
-        k_proj_weight (Tensor): Key projection weights.
-        v_proj_weight (Tensor): Value projection weights.
-        o_proj_weight (Tensor): Output projection weights.
-        in_features (Tensor): Input tensor of shape (batch_size, seq_len, d_model).
-        token_positions (Tensor): Tensor of token positions of shape (batch_size, seq_len).
-        use_flash (bool): Whether to use optimized attention implementation.
-        
-    Returns:
-        Tensor: Output tensor of shape (batch_size, seq_len, d_model).
-    """
-    # Use direct einsum operations for better performance
-    batch_size, seq_len, _ = in_features.shape
-    head_dim = d_model // num_heads
-    device = in_features.device
-    
-    # Direct projections using einsum
-    q = einsum(in_features, q_proj_weight, '... d_in, d_out d_in -> ... d_out')
-    k = einsum(in_features, k_proj_weight, '... d_in, d_out d_in -> ... d_out')
-    v = einsum(in_features, v_proj_weight, '... d_in, d_out d_in -> ... d_out')
-    
-    # Reshape for multi-head attention: [batch_size, seq_len, d_model] -> [batch_size, num_heads, seq_len, head_dim]
-    q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
-    k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
-    v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
-    
-    # Handle token positions for RoPE
-    if token_positions is None:
-        token_positions = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    
-    # Create RoPE module and apply to queries and keys for each head
-    rope_module = RotaryPositionalEmbedding(theta, head_dim, max_seq_len, device=device)
-    for i in range(num_heads):
-        q[:, i] = rope_module(q[:, i], token_positions)
-        k[:, i] = rope_module(k[:, i], token_positions)
-    
-    if use_flash and hasattr(F, 'scaled_dot_product_attention'):
-        # Use PyTorch's optimized scaled_dot_product_attention with causal mask
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=True  # This handles the causal masking efficiently
-        )
-    else:
-        # Fallback to manual implementation
-        # Create causal mask to prevent attending to future tokens
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).bool()
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
-        
-        # Apply scaled dot-product attention with causal mask
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-        scores = scores.masked_fill(~causal_mask, -1e9)  # Apply causal mask
-        
-        # Apply softmax to get attention weights
-        attn_weights = softmax(scores, dim=-1)
-        
-        # Apply attention weights to values
-        attn_output = torch.matmul(attn_weights, v)
-    
-    # Reshape back: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, d_model]
-    attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
-    
-    # Final linear projection using direct einsum
-    output = einsum(attn_output, o_proj_weight, '... d_in, d_out d_in -> ... d_out')
-    
-    return output
 
 class Linear(torch.nn.Module):
     def __init__(self, in_features, out_features, device=None, dtype=None):
@@ -870,18 +756,12 @@ def transformer_block(
     ln1_rms = torch.sqrt(ln1_mean + 1e-5)
     normed_features = (in_features / ln1_rms) * ln1_weight
     
-    attn_output = multihead_self_attention_with_rope(
-        d_model=d_model,
-        num_heads=num_heads,
-        max_seq_len=max_seq_len,
-        theta=theta,
-        q_proj_weight=q_proj_weight,
-        k_proj_weight=k_proj_weight,
-        v_proj_weight=v_proj_weight,
-        o_proj_weight=o_proj_weight,
-        in_features=normed_features,
-        token_positions=positions
-    )
+    attn = MultiHeadSelfAttentionWithRoPE(d_model, num_heads, max_seq_len, theta, device=in_features.device, dtype=in_features.dtype)
+    attn.q_proj.weight.data.copy_(q_proj_weight)
+    attn.k_proj.weight.data.copy_(k_proj_weight)
+    attn.v_proj.weight.data.copy_(v_proj_weight)
+    attn.output_proj.weight.data.copy_(o_proj_weight)
+    attn_output = attn(normed_features, token_positions=positions)
     
     # Residual connection
     res1 = in_features + attn_output

@@ -79,14 +79,14 @@ def get_dataset_defaults(dataset_name):
             'curve_path': 'openwebtext_learning_curve.npy',
             'vocab_size': 32000,
             'context_length': 512,    # Shorter context for lower memory
-            'd_model': 1792,          # Slightly smaller than previous, between GPT-2 Large and GPT-3 Small
-            'd_ff': 7168,             # Slightly smaller FFN
-            'num_layers': 36,         # Slightly fewer layers
-            'num_heads': 28,          # Fewer heads (must divide d_model)
+            'd_model': 1536,          # For ~1B params
+            'd_ff': 6144,             # For ~1B params
+            'num_layers': 24,         # For ~1B params
+            'num_heads': 24,          # Must divide d_model
             'batch_size': 16,         # Keep batch size reasonable for memory
             'num_steps': 160000,      # Keep Chinchilla token budget
             'accumulation_steps': 8,  # Reasonable for this size
-            'base_lr': 3e-4,          # Standard LR for GPT-2/3
+            'base_lr': 2e-4,          # Standard LR for GPT-2/3
             'min_lr': 1e-5,           # Proportionally lower min LR
             'max_grad_norm': 1.0,
             'rope_theta': 10000
@@ -524,10 +524,10 @@ def train_loop(config):
     # Load or initialize model and get data_pointer before using it
     model, optimizer, start_step, best_loss, data_pointer = load_checkpoint_simple(config, device)
     # Offload optimizer states to CPU to save GPU memory
-    for state in optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor) and v.device.type == 'cuda':
-                state[k] = v.cpu()
+    # for state in optimizer.state.values():
+    #     for k, v in state.items():
+    #         if isinstance(v, torch.Tensor) and v.device.type == 'cuda':
+    #             state[k] = v.cpu()
     # Optionally override data_pointer if requested
     if config.get('force_data_pointer_zero', False):
         print("[INFO] --force_data_pointer_zero specified: Forcing data_pointer to 0 (start from beginning of dataset)")
@@ -800,7 +800,7 @@ def train_loop(config):
                 log(f"Best model saved at step {step + 1} with loss {best_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f} to {config['checkpoint_path']}")
 
             # Periodic checkpoint save every 72 optimizer steps since this run started
-            if progress_log_counter % 300 == 0:
+            if progress_log_counter % 100 == 0:
                 periodic_checkpoint_path = config['checkpoint_path'].replace('.pt', f'_step_backup.pt')
                 save_checkpoint(model, optimizer, step, periodic_checkpoint_path, 
                     best_loss=avg_loss, additional_metadata={'data_pointer': global_data_pointer})
