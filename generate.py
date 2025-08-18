@@ -91,15 +91,16 @@ def main():
     parser.add_argument('--device', type=str, default='mps' if torch.backends.mps.is_available() else 'cpu', help='Device to run on (default: auto-detect)')
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (0.0=greedy, >1.0=more random, default: 1.0)')
     parser.add_argument('--top_p', type=float, default=1.0, help='Top-p (nucleus) sampling threshold (0.0-1.0, default: 1.0=no filtering)')
+    parser.add_argument('--weights_only', action='store_true', help='Load checkpoint as weights-only (model.state_dict)')
     args = parser.parse_args()
 
     # Dataset-specific defaults - match train.py exactly
     if args.dataset == 'owt':
-        default_ckpt = 'wikipedia_transformer_ckpt.pt'
+        default_ckpt = 'openwebtext_transformer_ckpt.pt'
         default_vocab = 'owt_bpe_vocab.pkl'
         default_merges = 'owt_bpe_merges.pkl'
-        default_num_heads = 12  # From train.py OWT config
-        default_context_length = 1024  # From train.py OWT config
+        default_num_heads = 24  # From train.py OWT config
+        default_context_length = 512  # From train.py OWT config
     else:
         default_ckpt = 'tinystories_transformer_ckpt.pt'
         default_vocab = '/Users/michaelli/Downloads/CS336_Assignment_1/tinystories_bpe_vocab.pkl'
@@ -114,7 +115,16 @@ def main():
 
     # Load model weights early to allow context_length inference
     device = torch.device(args.device)
-    weights = load_checkpoint(checkpoint, device)
+    if args.weights_only:
+        weights = torch.load(checkpoint, map_location=device)
+        # If loaded object is not a dict of tensors, fallback to normal logic
+        if not (isinstance(weights, dict) and all(isinstance(v, torch.Tensor) for v in weights.values())):
+            weights = load_checkpoint(checkpoint, device)
+        else:
+            # Ensure all tensors are on correct device and detached
+            weights = {k: v.to(device).clone().detach().requires_grad_(False) for k, v in weights.items()}
+    else:
+        weights = load_checkpoint(checkpoint, device)
 
     def infer_model_params(weights, default_num_heads):
         emb = weights["token_embeddings.weight"]

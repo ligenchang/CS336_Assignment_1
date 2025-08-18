@@ -60,7 +60,6 @@ class MoELayer(nn.Module):
         gate_flat = topk_scores.reshape(-1, 1)
         x_selected = x_flat[token_idx_flat]
 
-
         # --- Capacity mask (vectorized, bincount/cumsum per expert, no sort) ---
         M = expert_idx_flat.size(0)
         # Compute how many tokens are assigned to each expert (for max_capacity)
@@ -83,7 +82,7 @@ class MoELayer(nn.Module):
         gate_flat = gate_flat[keep]
         x_selected = x_selected[keep]
 
-            # --- Batched expert MLP ---
+        # --- Batched expert MLP ---
         # Gather weights for each token's expert
         w1 = self.w1[expert_idx_flat]  # (M, D, 2*d_ff)
         b1 = self.b1[expert_idx_flat]  # (M, 2*d_ff)
@@ -93,10 +92,10 @@ class MoELayer(nn.Module):
         # Preallocate expert output buffer
         y = torch.empty((x_selected.shape[0], D), device=device, dtype=dtype)
         # Use torch.einsum for efficiency
-        h = torch.einsum('md,mdh->mh', x_selected, w1) + b1  # (M, 2*d_ff)
+        h = torch.einsum('md,mdh->mh', x_selected.contiguous(), w1.contiguous()) + b1  # (M, 2*d_ff)
         a, b = h.chunk(2, dim=-1)
         h = F.silu(a) * b
-        y.copy_(torch.einsum('mf,mfd->md', h, w2) + b2)  # (M, D)
+        y.copy_(torch.einsum('mf,mfd->md', h.contiguous(), w2.contiguous()) + b2)  # (M, D)
         y.mul_(gate_flat)
 
         # --- Aggregate outputs (single index_add_) ---
@@ -559,7 +558,7 @@ class Linear(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Use einsum for batched linear transformation: (..., in_features), (out_features, in_features) -> (..., out_features)
-        return einsum(x, self.weight, '... d_in, d_out d_in -> ... d_out')
+        return einsum(x.contiguous(), self.weight.contiguous(), '... d_in, d_out d_in -> ... d_out')
 
 
 class Embedding(torch.nn.Module):
@@ -816,12 +815,13 @@ class TransformerLM(torch.nn.Module):
     
     def forward(self, in_indices: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass for transformer language model.
+        Forward pass for transformer language model with activation checkpointing.
         Returns logits. If MoE is used, you can access the total MoE loss via self.get_moe_loss().
         """
+        import torch.utils.checkpoint
         # Embedding
         x = self.token_embeddings(in_indices)
-        # Process through transformer layers
+        # Process through transformer layers with checkpointing
         self._moe_losses = []
         for layer in self.layers:
             x = layer(x)

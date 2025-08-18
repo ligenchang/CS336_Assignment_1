@@ -15,12 +15,132 @@ import pickle
 from cs336_basics.nn_utils import cross_entropy, TransformerLM
 from cs336_basics.optimizer import AdamW
 from cs336_basics.lr_scheduler import get_lr_cosine_schedule
-from cs336_basics.serialization import save_checkpoint, load_checkpoint_enhanced, checkpoint_exists
+from cs336_basics.serialization import save_checkpoint, checkpoint_exists
 
 
-# =============================================================================
-# MODEL DEFINITIONS
-# =============================================================================
+###############################################################################
+# DEVICE AND MODEL SETUP FUNCTIONS
+###############################################################################
+
+def setup_device():
+    """Setup device for training."""
+    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    return device
+
+def init_model(vocab_size, d_model, num_layers, num_heads, d_ff, context_length, rope_theta, device, config):
+    """Initialize model using the optimized TransformerLM class.
+    MoE support: pass use_moe, num_experts, top_k from config dict."""
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+        device=device,
+        dtype=torch.float32,
+        use_moe=config.get('use_moe', False),
+        num_experts=config.get('num_experts', 4),
+        top_k=config.get('top_k', 2)
+    )
+    return model
+
+def setup_gpu_optimization():
+    """Configure GPU settings for optimal performance."""
+    if torch.cuda.is_available():
+        # Set memory management environment variables for better memory utilization
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
+        torch.cuda.empty_cache()
+        # Use more aggressive memory fraction to utilize available memory
+        torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of GPU memory
+        # Enable TF32 for better performance on Ampere GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Enable optimized attention for better performance
+        torch.backends.cuda.enable_flash_sdp(True)
+        # Enable tensor caching for better performance
+        torch.backends.cudnn.benchmark = True
+        # Optimize for training
+        torch.backends.cudnn.deterministic = False
+        print(f"Initial GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f}GB")
+        print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f}GB")
+        print(f"Memory fraction set to: 95% = {torch.cuda.get_device_properties(0).total_memory * 0.95 / 1024**3:.2f}GB")
+
+def get_gpu_memory_info():
+    """Get current GPU memory usage info."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        free = total - reserved
+        return f"GPU: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved, {free:.1f}GB free"
+    return "GPU: Not available"
+
+
+###############################################################################
+# DATA LOADING AND PREFETCHING FUNCTIONS
+###############################################################################
+
+def token_stream(tokens_path, start_offset=0):
+    global_offset = 0
+    first_epoch = True
+    while True:  # multi-epoch loop
+        if first_epoch and start_offset != 0:
+            print(f"[DEBUG] token_stream: using start_offset={start_offset}")
+        with open(tokens_path, "rb") as f:
+            while True:
+                try:
+                    doc = pickle.load(f)
+                    doc_len = len(doc)
+                    if global_offset + doc_len <= start_offset:
+                        # Skip this entire chunk
+                        global_offset += doc_len
+                        continue
+                    else:
+                        # Yield tokens from start_offset within this chunk
+                        start_in_doc = max(0, start_offset - global_offset)
+                        for idx in range(start_in_doc, doc_len):
+                            yield doc[idx]
+                        global_offset += doc_len
+                except EOFError:
+                    break
+        # After first epoch, reset offsets for subsequent epochs
+        global_offset = 0
+        start_offset = 0
+        first_epoch = False
+
+def prefetch_tokens(tokens_path, start_offset=0, buffer_size=10_000_000):
+    import threading
+    import queue
+    q = queue.Queue(maxsize=2)
+    def loader():
+        print(f"[DEBUG] prefetch_tokens.loader: starting from start_offset={start_offset}")
+        buf = []
+        # If resuming from checkpoint, start_offset is the number of tokens already processed
+        total_tokens = start_offset
+        next_log = ((total_tokens // 100_000_000) + 1) * 100_000_000
+        global_offset = start_offset
+        for token in token_stream(tokens_path, start_offset=start_offset):
+            buf.append(token)
+            total_tokens += 1
+            if total_tokens >= next_log:
+                print(f"[INFO] Streaming loader: {total_tokens:,} tokens utilized so far.")
+                next_log += 100_000_000
+            if len(buf) >= buffer_size:
+                q.put((global_offset, np.array(buf, dtype=np.int32)))
+                global_offset += len(buf)
+                buf = []
+        if buf:
+            q.put((global_offset, np.array(buf, dtype=np.int32)))
+        print("[INFO] Completed one pass through the dataset. Restarting token stream for next epoch.")
+    threading.Thread(target=loader, daemon=True).start()
+    return q
+
+
+###############################################################################
+# TRAINING LOOP HELPERS
+###############################################################################
 
 def checkpointed_transformer_lm(model, in_indices, checkpoint_every_n_layers=4):
     """
@@ -28,43 +148,54 @@ def checkpointed_transformer_lm(model, in_indices, checkpoint_every_n_layers=4):
     Checkpoints every N layers to trade compute for memory.
     """
     device = in_indices.device
-    
     # Embedding (not checkpointed - minimal memory)
     x = model.token_embeddings(in_indices)
-    
     # Process layers in checkpointed chunks
     num_layers = len(model.layers)
     for chunk_start in range(0, num_layers, checkpoint_every_n_layers):
         chunk_end = min(chunk_start + checkpoint_every_n_layers, num_layers)
-        
         def checkpoint_chunk(x_input, start_idx, end_idx):
             """Process a chunk of transformer layers"""
             x_chunk = x_input
             for i in range(start_idx, end_idx):
                 x_chunk = model.layers[i](x_chunk)
             return x_chunk
-        
         # Apply gradient checkpointing to this chunk
         x = torch.utils.checkpoint.checkpoint(
-            checkpoint_chunk, 
-            x, 
-            chunk_start, 
+            checkpoint_chunk,
+            x,
+            chunk_start,
             chunk_end,
             use_reentrant=False
         )
-    
     # Final layer norm and LM head (not checkpointed - minimal memory)
     x = model.ln_final(x)
     logits = model.lm_head(x)
-    
     return logits
 
-
-# =============================================================================
-# DATA UTILITIES
-# =============================================================================
-
-
+def forward_pass(config, model, x, use_amp):
+    """Perform forward pass with optional gradient checkpointing."""
+    if config['use_gradient_checkpointing']:
+        # Use layer-wise gradient checkpointing for memory efficiency
+        if use_amp:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                logits = checkpointed_transformer_lm(
+                    model=model, in_indices=x, 
+                    checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
+                logits = logits.float()
+        else:
+            logits = checkpointed_transformer_lm(
+                model=model, in_indices=x, 
+                checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
+    else:
+        # Standard forward pass
+        if use_amp:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                logits = model(x)
+                logits = logits.float()
+        else:
+            logits = model(x)
+    return logits
 
 # =============================================================================
 # CONFIGURATION AND ARGUMENT PARSING
@@ -76,7 +207,7 @@ def get_dataset_defaults(dataset_name):
         return {
             'tokens_path': 'openwebtext_pretok_tokens.pkl',
             'checkpoint_path': 'openwebtext_transformer_ckpt.pt',
-            'curve_path': 'openwebtext_learning_curve.npy',
+            'curve_path': 'openwebtext_learning_curve.csv',
             'vocab_size': 32000,
             'context_length': 512,    # Shorter context for lower memory
             'd_model': 1536,          # For ~1B params
@@ -86,7 +217,7 @@ def get_dataset_defaults(dataset_name):
             'batch_size': 16,         # Keep batch size reasonable for memory
             'num_steps': 160000,      # Keep Chinchilla token budget
             'accumulation_steps': 8,  # Reasonable for this size
-            'base_lr': 2e-4,          # Standard LR for GPT-2/3
+            'base_lr': 1e-4,          # Standard LR for GPT-2/3
             'min_lr': 1e-5,           # Proportionally lower min LR
             'max_grad_norm': 1.0,
             'rope_theta': 10000
@@ -96,7 +227,7 @@ def get_dataset_defaults(dataset_name):
         return {
             'tokens_path': 'wikipedia_pretok_tokens.pkl',
             'checkpoint_path': 'wikipedia_transformer_ckpt.pt',
-            'curve_path': 'wikipedia_learning_curve.npy',
+            'curve_path': 'wikipedia_learning_curve.csv',
             'vocab_size': 32000,
             'context_length': 1024,
             'd_model': 1024,   # Smaller than GPT-2 Large
@@ -115,7 +246,7 @@ def get_dataset_defaults(dataset_name):
         return {
             'tokens_path': '/Users/michaelli/Downloads/CS336_Assignment_1/tinystories_pretok_tokens.pkl',
             'checkpoint_path': 'tinystories_transformer_ckpt.pt',
-            'curve_path': 'tinystories_learning_curve.npy',
+            'curve_path': 'tinystories_learning_curve.csv',
             'vocab_size': 10000,
             'context_length': 256,
             'd_model': 512,
@@ -180,8 +311,8 @@ def parse_args_and_config():
                        help='Enable PyTorch profiler (saves to ./profiler_logs)')
     
     # Model optimization options
-    parser.add_argument('--compile_model', action='store_true', 
-                       help='Enable PyTorch model compilation for better performance')
+    # parser.add_argument('--compile_model', action='store_true', 
+    #                    help='Enable PyTorch model compilation for better performance')
     parser.add_argument('--auto_batch_size', action='store_true', 
                        help='Automatically find optimal batch size for available GPU memory')
     # Forced checkpoint save
@@ -218,7 +349,7 @@ def parse_args_and_config():
         'checkpoint_every_n_layers': args.checkpoint_every_n_layers,
         'profile': args.profile,
         'torch_profiler': args.torch_profiler,
-        'compile_model': args.compile_model,
+    # 'compile_model': args.compile_model,
         'auto_batch_size': args.auto_batch_size,
         'force_save_once': args.force_save_once,
         'force_data_pointer_zero': args.force_data_pointer_zero,
@@ -311,119 +442,33 @@ def get_gpu_memory_info():
 # TRAINING LOOP
 # =============================================================================
 
+
+# Minimal checkpoint loader using serialization.load_any_checkpoint
 def load_checkpoint_simple(config, device):
-    """Simple checkpoint loading using basic serialization."""
-    # Always initialize model and optimizer from scratch
-    model = init_model(config['vocab_size'], config['d_model'], config['num_layers'], 
-                     config['num_heads'], config['d_ff'], config['context_length'], 
-                     config['rope_theta'], device, config)
+    """Minimal wrapper for checkpoint loading using serialization.load_any_checkpoint."""
+    model = init_model(
+        config['vocab_size'], config['d_model'], config['num_layers'],
+        config['num_heads'], config['d_ff'], config['context_length'],
+        config['rope_theta'], device, config)
     optimizer = AdamW(model.parameters(), lr=config['base_lr'], betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
-    
-    start_step = 0
-    best_loss = float('inf')
-    data_pointer = 0  # Default data pointer
-    
     checkpoint_path = config['checkpoint_path']
-    
-    # Try to load checkpoint - handle both local and S3 paths using enhanced functions
+    from cs336_basics.serialization import load_any_checkpoint
+    if not checkpoint_exists(checkpoint_path):
+        print(f"No checkpoint found at {checkpoint_path}. Starting from scratch.")
+        return model, optimizer, 0, float('inf'), 0
+    print(f"Checkpoint found! Loading from: {checkpoint_path}")
     try:
-        # Use checkpoint_exists for both S3 and local paths
-        print(f"Checking if checkpoint exists at: {checkpoint_path}")
-        if checkpoint_exists(checkpoint_path):
-            print(f"Checkpoint found! Loading from: {checkpoint_path}")
-            try:
-                # Try normal load first
-                iteration, metadata = load_checkpoint_enhanced(checkpoint_path, model, optimizer, device)
-                start_step = iteration + 1
-                best_loss = metadata.get('best_loss', float('inf'))
-                data_pointer = metadata.get('data_pointer', None)
-            except RuntimeError as e:
-                if "_orig_mod" in str(e):
-                    print("Checkpoint appears to be from a compiled model. Attempting to fix key names...")
-                    # Load the raw checkpoint data
-                    if checkpoint_path.startswith('s3://'):
-                        import boto3
-                        import io
-                        bucket, key = checkpoint_path.replace('s3://', '').split('/', 1)
-                        s3 = boto3.client('s3')
-                        buffer = io.BytesIO()
-                        s3.download_fileobj(bucket, key, buffer)
-                        buffer.seek(0)
-                        checkpoint_data = torch.load(buffer, map_location=device)
-                    else:
-                        checkpoint_data = torch.load(checkpoint_path, map_location=device)
-
-                    # Fix the state dict keys by removing _orig_mod prefix
-                    if 'model_state_dict' in checkpoint_data:
-                        fixed_state_dict = {}
-                        for key, value in checkpoint_data['model_state_dict'].items():
-                            if key.startswith('_orig_mod.'):
-                                new_key = key[len('_orig_mod.'):]
-                                fixed_state_dict[new_key] = value
-                            else:
-                                fixed_state_dict[key] = value
-                        model.load_state_dict(fixed_state_dict)
-                        if 'optimizer_state_dict' in checkpoint_data:
-                            optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
-                        iteration = checkpoint_data.get('iteration', 0)
-                        start_step = iteration + 1
-                        # Extract best_loss and data_pointer from top-level keys for compiled model
-                        best_loss = checkpoint_data.get('best_loss', float('inf'))
-                        data_pointer = checkpoint_data.get('data_pointer', None)
-                        print(f"Successfully loaded compiled model checkpoint with fixed keys")
-                    else:
-                        raise e
-                else:
-                    raise e
-
-            if data_pointer is None:
-                # Calculate data_pointer for legacy checkpoints
-                tokens_per_step = config['batch_size'] * config['context_length']
-                total_tokens_processed = iteration * tokens_per_step
-                with open(config['tokens_path'], "rb") as f:
-                    tokens = pickle.load(f)
-                total_tokens = len(tokens)
-                max_start = total_tokens - config['context_length'] - 1
-                data_pointer = total_tokens_processed % total_tokens
-                if data_pointer >= max_start:
-                    data_pointer = 0
-                tokens_per_epoch = total_tokens
-                current_epoch = total_tokens_processed // tokens_per_epoch
-                tokens_in_current_epoch = total_tokens_processed % tokens_per_epoch
-                epoch_progress = (tokens_in_current_epoch / tokens_per_epoch) * 100
-                print(f"Legacy checkpoint detected - calculated data_pointer: {data_pointer}")
-                print(f"  Total tokens processed: {total_tokens_processed:,}")
-                print(f"  Dataset size: {total_tokens:,} tokens")
-                print(f"  Tokens per step: {tokens_per_step}")
-                print(f"  Training epoch: {current_epoch + 1} (epoch {current_epoch + 1:.1f}, {epoch_progress:.1f}% through current epoch)")
-                print(f"  Epochs completed: {current_epoch}, tokens in current epoch: {tokens_in_current_epoch:,}")
-            print(f"Resumed from checkpoint at step {start_step} with best_loss {best_loss:.4f}, data_pointer {data_pointer}")
-        else:
-            print(f"No checkpoint found at {checkpoint_path}. Starting from scratch.")
+        start_step, best_loss, data_pointer, _ = load_any_checkpoint(
+            checkpoint_path, model, optimizer, device=device, strict=True)
+        print(f"[INFO] Loaded checkpoint: {checkpoint_path}")
+        print(f"Resumed from checkpoint at step {start_step} with best_loss {best_loss:.4f}, data_pointer {data_pointer}")
+        return model, optimizer, start_step, best_loss, data_pointer
     except Exception as e:
-        print(f"Could not load checkpoint from {checkpoint_path}: {e}\nStarting from scratch.")
-    return model, optimizer, start_step, best_loss, data_pointer
+        print(f"[WARN] Could not load checkpoint from {checkpoint_path}: {e}\nStarting from scratch.")
+        return model, optimizer, 0, float('inf'), 0
 
 
-def compile_model_if_requested(model, config):
-    """Compile model if compilation is requested and supported."""
-    if config.get('compile_model', False):
-        if hasattr(torch, 'compile'):
-            print("Compiling model for optimized performance...")
-            try:
-                # Use default compilation mode for best balance of compilation time vs performance
-                compiled_model = torch.compile(model)
-                print("Model compilation successful!")
-                return compiled_model
-            except Exception as e:
-                print(f"Model compilation failed: {e}")
-                print("Continuing with uncompiled model...")
-                return model
-        else:
-            print("Model compilation requested but torch.compile not available (requires PyTorch 2.0+)")
-            print("Continuing with uncompiled model...")
-            return model
-    return model
+
 
 
 def forward_pass(config, model, x, use_amp):
@@ -590,35 +635,7 @@ def train_loop(config):
             print(f"    Dense FFN parameters (SwiGLU, non-MoE layers): {ffn_params:,}")
     else:
         print(f"  Dense FFN parameters (SwiGLU): {ffn_params:,}")
-    # # Load total number of tokens in the dataset for Chinchilla analysis
-    # try:
-    #     from tqdm import tqdm
-    # except ImportError:
-    #     tqdm = None
-    # try:
-    #     with open(config['tokens_path'], "rb") as f:
-    #         doc_count = 0
-    #         total_tokens = 0
-    #         print("[INFO] Counting total tokens in dataset for Chinchilla analysis (memory efficient)...")
-    #         if tqdm is not None:
-    #             pbar = tqdm(desc="Counting docs", unit="doc")
-    #         else:
-    #             pbar = None
-    #         while True:
-    #             try:
-    #                 doc = pickle.load(f)
-    #                 total_tokens += len(doc)
-    #                 doc_count += 1
-    #                 if pbar is not None:
-    #                     pbar.update(1)
-    #             except EOFError:
-    #                 break
-    #         if pbar is not None:
-    #             pbar.close()
-    #         print(f"[INFO] Total docs: {doc_count}, total tokens: {total_tokens:,}")
-    # except Exception as e:
-    #     print(f"[WARN] Could not load total token count for Chinchilla analysis: {e}")
-    #     total_tokens = len(buffer_tokens)
+   
     total_tokens = 8581129216
     print(f"[INFO] Chinchilla scaling analysis:")
     print(f"  Training tokens (total in dataset): {total_tokens:,}")
@@ -633,8 +650,7 @@ def train_loop(config):
     else:
         print(f"  ⚠️  Model is overtrained (too many parameters)")
     
-    # Compile model if requested
-    model = compile_model_if_requested(model, config)
+    # Model compilation removed
 
     # Training setup
     optimizer.zero_grad()
@@ -660,7 +676,7 @@ def train_loop(config):
     log("Starting training...")
     log(f"Training configuration: steps {start_step} to {config['num_steps']} (total: {config['num_steps'] - start_step} remaining)")
     log(f"Gradient checkpointing: {'enabled (every ' + str(config['checkpoint_every_n_layers']) + ' layers)' if config['use_gradient_checkpointing'] else 'disabled'}")
-    log(f"Model compilation: {'enabled' if config.get('compile_model', False) else 'disabled'}")
+    # log(f"Model compilation: {'enabled' if config.get('compile_model', False) else 'disabled'}")
     log(f"Current best loss to beat: {best_loss:.4f}")
     
     losses = []
@@ -797,7 +813,13 @@ def train_loop(config):
                 last_best_save_step = step + 1
                 save_checkpoint(model, optimizer, step, config['checkpoint_path'], 
                     best_loss=best_loss, additional_metadata={'data_pointer': global_data_pointer})
+                # Save learning curve as CSV whenever best model is saved
+                with open(config['curve_path'], 'w') as f:
+                    f.write('step,loss\n')
+                    for i, l in enumerate(losses):
+                        f.write(f"{i},{l}\n")
                 log(f"Best model saved at step {step + 1} with loss {best_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f} to {config['checkpoint_path']}")
+                log(f"Learning curve saved as CSV at step {step + 1}.")
 
             # Periodic checkpoint save every 72 optimizer steps since this run started
             if progress_log_counter % 100 == 0:
@@ -829,9 +851,12 @@ def train_loop(config):
     if profiler is not None:
         profiler.stop()
     
-    # Save learning curve
-    np.save(config['curve_path'], np.array(losses))
-    log("Training finished. Learning curve saved.")
+    # Save final learning curve as CSV
+    with open(config['curve_path'], 'w') as f:
+        f.write('step,loss\n')
+        for i, l in enumerate(losses):
+            f.write(f"{i},{l}\n")
+    log(f"Training finished. Learning curve saved as CSV. Best loss: {best_loss:.4f}")
 
 
 # =============================================================================
