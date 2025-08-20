@@ -1,9 +1,8 @@
-
 import pickle
 import numpy as np
 from cs336_basics.tokenizer import Tokenizer
 
-tokens_path = "books_pretok_tokens.pkl"
+tokens_path = "wikipedia_pretok_tokens.pkl"
 vocab_path = "owt_bpe_vocab.pkl"  # Change if using a different vocab
 merges_path = "owt_bpe_merges.pkl"  # Change if using a different merges
 # Load vocab and merges from pickle files
@@ -65,3 +64,16 @@ first_1000 = all_tokens[:1000]
 decoded_text = tokenizer.decode(first_1000)
 print("[INFO] Decoded text from first 1000 tokens:")
 print(decoded_text)
+
+# Count total number of tokens in the dataset
+print("[INFO] Counting total number of tokens in the dataset...")
+total_tokens = 0
+with open(tokens_path, "rb") as f:
+    while True:
+        try:
+            obj = pickle.load(f)
+        except EOFError:
+            break
+        if isinstance(obj, (list, tuple, np.ndarray)):
+            total_tokens += len(obj)
+print(f"[INFO] Total number of tokens in {tokens_path}: {total_tokens:,}")

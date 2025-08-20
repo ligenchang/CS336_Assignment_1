@@ -74,27 +74,22 @@ def run_embedding(
 def run_swiglu(
     d_model: int,
     d_ff: int,
-    w1_weight: Float[Tensor, " d_ff d_model"],
-    w2_weight: Float[Tensor, " d_model d_ff"],
-    w3_weight: Float[Tensor, " d_ff d_model"],
-    in_features: Float[Tensor, " ... d_model"],
-) -> Float[Tensor, " ... d_model"]:
-    """Given the weights of a SwiGLU network, return
-    the output of your implementation with these weights.
-
-    Args:
-        d_model (int): Dimensionality of the feedforward input and output.
-        d_ff (int): Dimensionality of the up-project happening internally to your swiglu.
-        w1_weight (Float[Tensor, "d_ff d_model"]): Stored weights for W1
-        w2_weight (Float[Tensor, "d_model d_ff"]): Stored weights for W2
-        w3_weight (Float[Tensor, "d_ff d_model"]): Stored weights for W3
-        in_features (Float[Tensor, "... d_model"]): Input embeddings to the feed-forward layer.
-
-    Returns:
-        Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
+    w1_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w3_weight: torch.Tensor,
+    in_features: torch.Tensor,
+) -> torch.Tensor:
     """
-    from cs336_basics import swiglu
-    return swiglu(d_model, d_ff, w1_weight, w2_weight, w3_weight, in_features)
+    Given the weights of a SwiGLU network, return the output of your implementation with these weights using the class-based SwiGLU.
+    """
+    from cs336_basics.nn_utils import SwiGLU
+    device = in_features.device
+    dtype = in_features.dtype
+    swiglu_module = SwiGLU(d_model, d_ff, device=device, dtype=dtype)
+    swiglu_module.w1.weight.data.copy_(w1_weight)
+    swiglu_module.w2.weight.data.copy_(w2_weight)
+    swiglu_module.w3.weight.data.copy_(w3_weight)
+    return swiglu_module(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -150,7 +145,14 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    from cs336_basics import multihead_self_attention
+    from cs336_basics.nn_utils import MultiHeadSelfAttention
+    # Create an instance of the class and set weights
+    attn = MultiHeadSelfAttention(d_model, num_heads, device=in_features.device, dtype=in_features.dtype)
+    attn.q_proj.weight.data.copy_(q_proj_weight)
+    attn.k_proj.weight.data.copy_(k_proj_weight)
+    attn.v_proj.weight.data.copy_(v_proj_weight)
+    attn.output_proj.weight.data.copy_(o_proj_weight)
+    return attn(in_features, use_flash=True)
     return multihead_self_attention(
         d_model=d_model,
         num_heads=num_heads,
@@ -232,79 +234,6 @@ def run_rope(
     rope_module = RotaryPositionalEmbedding(theta, d_k, max_seq_len, device=in_query_or_key.device)
     return rope_module(in_query_or_key, token_positions)
 
-
-def run_transformer_block(
-    d_model: int,
-    num_heads: int,
-    d_ff: int,
-    max_seq_len: int,
-    theta: float,
-    weights: dict[str, Tensor],
-    in_features: Float[Tensor, " batch sequence_length d_model"],
-) -> Float[Tensor, " batch sequence_length d_model"]:
-    """
-    Given the weights of a pre-norm Transformer block and input features,
-    return the output of running the Transformer block on the input features.
-
-    This function should use RoPE.
-    Depending on your implementation, you may simply need to pass the relevant args
-    to your TransformerBlock constructor, or you may need to initialize your own RoPE
-    class and pass that instead.
-
-    Args:
-        d_model (int): The dimensionality of the Transformer block input.
-        num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
-            evenly divisible by `num_heads`.
-        d_ff (int): Dimensionality of the feed-forward inner layer.
-        max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
-        theta (float): RoPE parameter.
-        weights (dict[str, Tensor]):
-            State dict of our reference implementation.
-            The keys of this dictionary are:
-            - `attn.q_proj.weight`
-                The query projections for all `num_heads` attention heads.
-                Shape is (d_model, d_model).
-                The rows are ordered by matrices of shape (num_heads, d_k),
-                so `attn.q_proj.weight == torch.cat([q_heads.0.weight, ..., q_heads.N.weight], dim=0)`.
-            - `attn.k_proj.weight`
-                The key projections for all `num_heads` attention heads.
-                Shape is (d_model, d_model).
-                The rows are ordered by matrices of shape (num_heads, d_k),
-                so `attn.k_proj.weight == torch.cat([k_heads.0.weight, ..., k_heads.N.weight], dim=0)`.
-            - `attn.v_proj.weight`
-                The value projections for all `num_heads` attention heads.
-                Shape is (d_model, d_model).
-                The rows are ordered by matrices of shape (num_heads, d_v),
-                so `attn.v_proj.weight == torch.cat([v_heads.0.weight, ..., v_heads.N.weight], dim=0)`.
-            - `attn.output_proj.weight`
-                Weight of the multi-head self-attention output projection
-                Shape is (d_model, d_model).
-            - `ln1.weight`
-                Weights of affine transform for the first RMSNorm
-                applied in the transformer block.
-                Shape is (d_model,).
-            - `ffn.w1.weight`
-                Weight of the first linear transformation in the FFN.
-                Shape is (d_model, d_ff).
-            - `ffn.w2.weight`
-                Weight of the second linear transformation in the FFN.
-                Shape is (d_ff, d_model).
-            - `ffn.w3.weight`
-                Weight of the third linear transformation in the FFN.
-                Shape is (d_model, d_ff).
-            - `ln2.weight`
-                Weights of affine transform for the second RMSNorm
-                applied in the transformer block.
-                Shape is (d_model,).
-        in_features (Float[Tensor, "batch sequence_length d_model"]):
-            Tensor to run your implementation on.
-
-    Returns:
-        Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
-        running the Transformer block on the input features while using RoPE.
-    """
-    from cs336_basics import transformer_block
-    return transformer_block(d_model, num_heads, d_ff, max_seq_len, theta, weights, in_features)
 
 
 def run_transformer_lm(
@@ -656,3 +585,33 @@ def run_train_bpe(
     """
     from cs336_basics.train_bpe import train_bpe
     return train_bpe(input_path, vocab_size, special_tokens, **kwargs)
+
+
+def run_transformer_block(
+    d_model: int,
+    num_heads: int,
+    d_ff: int,
+    max_seq_len: int,
+    theta: float,
+    weights: dict[str, Tensor],
+    in_features: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Given the weights of a pre-norm Transformer block and input features,
+    return the output of running the Transformer block on the input features using the class-based implementation.
+    """
+    from cs336_basics.nn_utils import TransformerBlock
+    device = in_features.device
+    dtype = in_features.dtype
+    block = TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta, device=device, dtype=dtype)
+    # Set weights
+    block.attn.q_proj.weight.data.copy_(weights["attn.q_proj.weight"])
+    block.attn.k_proj.weight.data.copy_(weights["attn.k_proj.weight"])
+    block.attn.v_proj.weight.data.copy_(weights["attn.v_proj.weight"])
+    block.attn.output_proj.weight.data.copy_(weights["attn.output_proj.weight"])
+    block.ln1.weight.data.copy_(weights["ln1.weight"])
+    block.ln2.weight.data.copy_(weights["ln2.weight"])
+    block.ffn.w1.weight.data.copy_(weights["ffn.w1.weight"])
+    block.ffn.w2.weight.data.copy_(weights["ffn.w2.weight"])
+    block.ffn.w3.weight.data.copy_(weights["ffn.w3.weight"])
+    return block(in_features)

@@ -22,40 +22,36 @@ def softmax_with_temperature(logits, temperature=1.0):
     exp_logits = torch.exp(scaled_logits - max_logit)
     return exp_logits / torch.sum(exp_logits)
 
+def top_k_sampling(probs, top_k=None):
+    """Apply top-k sampling to probability distribution."""
+    if top_k is None or top_k <= 0 or top_k >= probs.size(0):
+        return probs
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+    filtered_probs = torch.zeros_like(probs)
+    kept_indices = sorted_indices[:top_k]
+    kept_probs = sorted_probs[:top_k]
+    kept_probs = kept_probs / torch.sum(kept_probs)
+    filtered_probs[kept_indices] = kept_probs
+    return filtered_probs
+
 def nucleus_sampling(probs, top_p=1.0):
     """Apply top-p (nucleus) sampling to probability distribution."""
     if top_p >= 1.0:
         # No filtering, return original probabilities
         return probs
-    
-    # Sort probabilities in descending order
     sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-    
-    # Compute cumulative probabilities
     cumulative_probs = torch.cumsum(sorted_probs, dim=0)
-    
-    # Find the cutoff point where cumulative probability exceeds top_p
-    # Keep at least the first token (the most likely one)
     cutoff_mask = cumulative_probs > top_p
     if torch.any(cutoff_mask):
-        # Find first position where cumsum > top_p
         cutoff_idx = torch.where(cutoff_mask)[0][0].item()
-        # Keep tokens up to (but not including) the cutoff
-        # But always keep at least the top token
         keep_count = max(1, cutoff_idx)
     else:
-        # All tokens have cumulative prob <= top_p, keep all
         keep_count = len(sorted_probs)
-    
-    # Create filtered probability distribution
     filtered_probs = torch.zeros_like(probs)
     kept_indices = sorted_indices[:keep_count]
     kept_probs = sorted_probs[:keep_count]
-    
-    # Renormalize the kept probabilities
     kept_probs = kept_probs / torch.sum(kept_probs)
     filtered_probs[kept_indices] = kept_probs
-    
     return filtered_probs
 
 def load_checkpoint(path, device):
@@ -91,12 +87,13 @@ def main():
     parser.add_argument('--device', type=str, default='mps' if torch.backends.mps.is_available() else 'cpu', help='Device to run on (default: auto-detect)')
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (0.0=greedy, >1.0=more random, default: 1.0)')
     parser.add_argument('--top_p', type=float, default=1.0, help='Top-p (nucleus) sampling threshold (0.0-1.0, default: 1.0=no filtering)')
+    parser.add_argument('--top_k', type=int, default=None, help='Top-k sampling (keep only k most likely tokens; default: None)')
     parser.add_argument('--weights_only', action='store_true', help='Load checkpoint as weights-only (model.state_dict)')
     args = parser.parse_args()
 
     # Dataset-specific defaults - match train.py exactly
     if args.dataset == 'owt':
-        default_ckpt = 'openwebtext_transformer_ckpt.pt'
+        default_ckpt = 'openwebtext_transformer_ckptstep_backup.pt.weights'
         default_vocab = 'owt_bpe_vocab.pkl'
         default_merges = 'owt_bpe_merges.pkl'
         default_num_heads = 24  # From train.py OWT config
@@ -247,6 +244,9 @@ def main():
             logits = model(x)
         next_token_logits = logits[0, len(input_ids)-1].float()
         probs = softmax_with_temperature(next_token_logits, args.temperature)
+        # Apply top_k and top_p sampling in sequence if specified
+        if args.top_k is not None and args.top_k > 0:
+            probs = top_k_sampling(probs, args.top_k)
         if args.top_p < 1.0:
             probs = nucleus_sampling(probs, args.top_p)
         if args.temperature == 0.0:

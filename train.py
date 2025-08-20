@@ -175,26 +175,33 @@ def checkpointed_transformer_lm(model, in_indices, checkpoint_every_n_layers=4):
 
 def forward_pass(config, model, x, use_amp):
     """Perform forward pass with optional gradient checkpointing."""
-    if config['use_gradient_checkpointing']:
-        # Use layer-wise gradient checkpointing for memory efficiency
-        if use_amp:
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                logits = checkpointed_transformer_lm(
-                    model=model, in_indices=x, 
-                    checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
-                logits = logits.float()
-        else:
-            logits = checkpointed_transformer_lm(
-                model=model, in_indices=x, 
-                checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
-    else:
-        # Standard forward pass
-        if use_amp:
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                logits = model(x)
-                logits = logits.float()
-        else:
-            logits = model(x)
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        logits = checkpointed_transformer_lm(
+            model=model, in_indices=x, 
+            checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
+    # with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+    #     logits = model(x)
+    #     logits = logits.float()
+    # if config['use_gradient_checkpointing']:
+    #     # Use layer-wise gradient checkpointing for memory efficiency
+    #     if use_amp:
+    #         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+    #             logits = checkpointed_transformer_lm(
+    #                 model=model, in_indices=x, 
+    #                 checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
+    #             logits = logits.float()
+    #     else:
+    #         logits = checkpointed_transformer_lm(
+    #             model=model, in_indices=x, 
+    #             checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
+    # else:
+    #     # Standard forward pass
+    #     if use_amp:
+    #         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+    #             logits = model(x)
+    #             logits = logits.float()
+    #     else:
+    #         logits = model(x)
     return logits
 
 # =============================================================================
@@ -207,7 +214,7 @@ def get_dataset_defaults(dataset_name):
         return {
             'tokens_path': 'openwebtext_pretok_tokens.pkl',
             'checkpoint_path': 'openwebtext_transformer_ckpt.pt',
-            'curve_path': 'openwebtext_learning_curve.csv',
+            'curve_path': 'openwebtext_learning_curve.npy',
             'vocab_size': 32000,
             'context_length': 512,    # Shorter context for lower memory
             'd_model': 1536,          # For ~1B params
@@ -217,7 +224,7 @@ def get_dataset_defaults(dataset_name):
             'batch_size': 16,         # Keep batch size reasonable for memory
             'num_steps': 160000,      # Keep Chinchilla token budget
             'accumulation_steps': 8,  # Reasonable for this size
-            'base_lr': 1e-4,          # Standard LR for GPT-2/3
+            'base_lr': 2e-4,          # Standard LR for GPT-2/3
             'min_lr': 1e-5,           # Proportionally lower min LR
             'max_grad_norm': 1.0,
             'rope_theta': 10000
@@ -227,7 +234,7 @@ def get_dataset_defaults(dataset_name):
         return {
             'tokens_path': 'wikipedia_pretok_tokens.pkl',
             'checkpoint_path': 'wikipedia_transformer_ckpt.pt',
-            'curve_path': 'wikipedia_learning_curve.csv',
+            'curve_path': 'wikipedia_learning_curve.npy',
             'vocab_size': 32000,
             'context_length': 1024,
             'd_model': 1024,   # Smaller than GPT-2 Large
@@ -246,7 +253,7 @@ def get_dataset_defaults(dataset_name):
         return {
             'tokens_path': '/Users/michaelli/Downloads/CS336_Assignment_1/tinystories_pretok_tokens.pkl',
             'checkpoint_path': 'tinystories_transformer_ckpt.pt',
-            'curve_path': 'tinystories_learning_curve.csv',
+            'curve_path': 'tinystories_learning_curve.npy',
             'vocab_size': 10000,
             'context_length': 256,
             'd_model': 512,
@@ -311,8 +318,8 @@ def parse_args_and_config():
                        help='Enable PyTorch profiler (saves to ./profiler_logs)')
     
     # Model optimization options
-    # parser.add_argument('--compile_model', action='store_true', 
-    #                    help='Enable PyTorch model compilation for better performance')
+    parser.add_argument('--compile_model', action='store_true', 
+                       help='Enable PyTorch model compilation for better performance')
     parser.add_argument('--auto_batch_size', action='store_true', 
                        help='Automatically find optimal batch size for available GPU memory')
     # Forced checkpoint save
@@ -349,7 +356,7 @@ def parse_args_and_config():
         'checkpoint_every_n_layers': args.checkpoint_every_n_layers,
         'profile': args.profile,
         'torch_profiler': args.torch_profiler,
-    # 'compile_model': args.compile_model,
+        'compile_model': args.compile_model,
         'auto_batch_size': args.auto_batch_size,
         'force_save_once': args.force_save_once,
         'force_data_pointer_zero': args.force_data_pointer_zero,
@@ -450,7 +457,7 @@ def load_checkpoint_simple(config, device):
         config['vocab_size'], config['d_model'], config['num_layers'],
         config['num_heads'], config['d_ff'], config['context_length'],
         config['rope_theta'], device, config)
-    optimizer = AdamW(model.parameters(), lr=config['base_lr'], betas=(0.9, 0.99), eps=1e-8, weight_decay=0.01)
+    optimizer = AdamW(model.parameters(), lr=config['base_lr'], betas=(0.9, 0.95), eps=1e-8, weight_decay=0.001)
     checkpoint_path = config['checkpoint_path']
     from cs336_basics.serialization import load_any_checkpoint
     if not checkpoint_exists(checkpoint_path):
@@ -469,32 +476,6 @@ def load_checkpoint_simple(config, device):
 
 
 
-
-
-def forward_pass(config, model, x, use_amp):
-    """Perform forward pass with optional gradient checkpointing."""
-    if config['use_gradient_checkpointing']:
-        # Use layer-wise gradient checkpointing for memory efficiency
-        if use_amp:
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                logits = checkpointed_transformer_lm(
-                    model=model, in_indices=x, 
-                    checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
-                logits = logits.float()
-        else:
-            logits = checkpointed_transformer_lm(
-                model=model, in_indices=x, 
-                checkpoint_every_n_layers=config['checkpoint_every_n_layers'])
-    else:
-        # Standard forward pass
-        if use_amp:
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                logits = model(x)
-                logits = logits.float()
-        else:
-            logits = model(x)
-    
-    return logits
 
 
 def train_loop(config):
@@ -676,7 +657,6 @@ def train_loop(config):
     log("Starting training...")
     log(f"Training configuration: steps {start_step} to {config['num_steps']} (total: {config['num_steps'] - start_step} remaining)")
     log(f"Gradient checkpointing: {'enabled (every ' + str(config['checkpoint_every_n_layers']) + ' layers)' if config['use_gradient_checkpointing'] else 'disabled'}")
-    # log(f"Model compilation: {'enabled' if config.get('compile_model', False) else 'disabled'}")
     log(f"Current best loss to beat: {best_loss:.4f}")
     
     losses = []
@@ -702,21 +682,23 @@ def train_loop(config):
     min_best_save_interval = 1000
     force_save_done = False
     progress_log_counter = 0
+    warmup_iters = int(0.05 * config['num_steps'])
+    cosine_cycle_iters = config['num_steps'] - warmup_iters
+
     for step in range(start_step, config['num_steps']):
         # Regularly clear CUDA cache to help with memory fragmentation
         if torch.cuda.is_available() and step % 100 == 0:
             torch.cuda.empty_cache()
         step_start_time = time.time() if config['profile'] else None
 
-        # Use constant lr for first 90%, then linearly decay to min_lr in last 10%
-        progress = (step - start_step) / max(1, config['num_steps'] - start_step)
-        if progress < 0.9:
-            lr = config['base_lr']
-        else:
-            # Linear decay from base_lr to min_lr over last 10%
-            decay_progress = (progress - 0.9) / 0.1
-            lr = config['base_lr'] * (1 - decay_progress) + config['min_lr'] * decay_progress
-            lr = max(lr, config['min_lr'])
+        # Compute learning rate using get_lr_cosine_schedule and set it
+        lr = get_lr_cosine_schedule(
+            it=step,
+            max_learning_rate=config['base_lr'],
+            min_learning_rate=config['min_lr'],
+            warmup_iters=warmup_iters,
+            cosine_cycle_iters=cosine_cycle_iters
+        )
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -813,13 +795,10 @@ def train_loop(config):
                 last_best_save_step = step + 1
                 save_checkpoint(model, optimizer, step, config['checkpoint_path'], 
                     best_loss=best_loss, additional_metadata={'data_pointer': global_data_pointer})
-                # Save learning curve as CSV whenever best model is saved
-                with open(config['curve_path'], 'w') as f:
-                    f.write('step,loss\n')
-                    for i, l in enumerate(losses):
-                        f.write(f"{i},{l}\n")
+                # Save learning curve and best loss whenever best model is saved
+                np.savez(config['curve_path'], losses=np.array(losses), best_loss=best_loss)
                 log(f"Best model saved at step {step + 1} with loss {best_loss:.4f}, lr={optimizer.param_groups[0]['lr']:.6f} to {config['checkpoint_path']}")
-                log(f"Learning curve saved as CSV at step {step + 1}.")
+                log(f"Learning curve and best loss saved at step {step + 1}.")
 
             # Periodic checkpoint save every 72 optimizer steps since this run started
             if progress_log_counter % 100 == 0:
@@ -851,12 +830,9 @@ def train_loop(config):
     if profiler is not None:
         profiler.stop()
     
-    # Save final learning curve as CSV
-    with open(config['curve_path'], 'w') as f:
-        f.write('step,loss\n')
-        for i, l in enumerate(losses):
-            f.write(f"{i},{l}\n")
-    log(f"Training finished. Learning curve saved as CSV. Best loss: {best_loss:.4f}")
+    # Save final learning curve and best loss
+    np.savez(config['curve_path'], losses=np.array(losses), best_loss=best_loss)
+    log("Training finished. Learning curve and best loss saved.")
 
 
 # =============================================================================

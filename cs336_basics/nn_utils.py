@@ -198,8 +198,7 @@ def scaled_dot_product_attention(
     Q: Tensor,
     K: Tensor,
     V: Tensor,
-    mask: Optional[Tensor] = None,
-    use_flash: bool = True
+    mask: Optional[Tensor] = None
 ) -> Tensor:
     """
     Computes the scaled dot-product attention as described in the 'Attention is All You Need' paper.
@@ -215,36 +214,18 @@ def scaled_dot_product_attention(
     Returns:
         Tensor: Output tensor of shape (..., queries, d_v)
     """
-    if use_flash and hasattr(F, 'scaled_dot_product_attention'):
-        # Use PyTorch's optimized scaled_dot_product_attention (includes FlashAttention)
-        # Convert mask format: PyTorch SDPA expects True for positions to attend to
-        attn_mask = None
-        if mask is not None:
-            attn_mask = mask.bool()
-        
-        return F.scaled_dot_product_attention(
-            Q, K, V, 
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=False  # We handle causality with explicit mask
-        )
-    else:
-        # Fallback to manual implementation
-        # Get the dimension of the keys
-        d_k = K.size(-1)
-        
-        # Compute the scaled dot-product (Q·K^T / sqrt(d_k))
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
-        
-        # Apply mask if provided
-        if mask is not None:
-            scores = scores.masked_fill(~mask, -1e9)
-        
-        # Apply softmax to get attention weights
-        attn_weights = softmax(scores, dim=-1)
-        
-        # Compute the weighted sum (attention weights · V)
-        return torch.matmul(attn_weights, V)
+
+    attn_mask = None
+    if mask is not None:
+        attn_mask = mask.bool()
+    
+    return F.scaled_dot_product_attention(
+        Q, K, V, 
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+        is_causal=False  # We handle causality with explicit mask
+    )
+
 
 class RotaryPositionalEmbedding(torch.nn.Module):
     """
@@ -288,10 +269,10 @@ class RotaryPositionalEmbedding(torch.nn.Module):
             torch.Tensor: Rotated tensor of same shape as input
         """
         # Make sure token_positions has the right shape
-        if token_positions.dim() < x.dim() - 1:
-            # Add batch dimensions if needed
-            print("Alerting!!!!!Reshaping token positions for RoPE")
-            token_positions = token_positions.view(*([1] * (x.dim() - token_positions.dim() - 1)), *token_positions.shape)
+        # if token_positions.dim() < x.dim() - 1:
+        #     # Add batch dimensions if needed
+        #     print("Alerting!!!!!Reshaping token positions for RoPE")
+        #     token_positions = token_positions.view(*([1] * (x.dim() - token_positions.dim() - 1)), *token_positions.shape)
         
         # Compute rotation angles based on token positions
         angles = token_positions.unsqueeze(-1) * self.freqs
@@ -376,30 +357,12 @@ class MultiHeadSelfAttention(torch.nn.Module):
         k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         
-        if use_flash and hasattr(F, 'scaled_dot_product_attention'):
-            # Use PyTorch's optimized scaled_dot_product_attention with causal mask
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=True  # This handles the causal masking efficiently
-            )
-        else:
-            # Fallback to manual implementation
-            # Create causal mask to prevent attending to future tokens
-            # Shape: [seq_len, seq_len]
-            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=in_features.device)).bool()
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
-            
-            # Apply scaled dot-product attention with causal mask
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores = scores.masked_fill(~causal_mask, -1e9)  # Apply causal mask
-            
-            # Apply softmax to get attention weights
-            attn_weights = softmax(scores, dim=-1)
-            
-            # Apply attention weights to values
-            attn_output = torch.matmul(attn_weights, v)
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True  # This handles the causal masking efficiently
+        )
         
         # Reshape back: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, d_model]
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
@@ -409,61 +372,6 @@ class MultiHeadSelfAttention(torch.nn.Module):
         
         return output
 
-def multihead_self_attention(
-    d_model: int,
-    num_heads: int,
-    q_proj_weight: Tensor,
-    k_proj_weight: Tensor,
-    v_proj_weight: Tensor,
-    o_proj_weight: Tensor,
-    in_features: Tensor,
-    use_flash: bool = True
-) -> Tensor:
-    """
-    Implements multi-head self-attention as described in the 'Attention is All You Need' paper.
-    
-    Args:
-        d_model (int): Dimensionality of the model.
-        num_heads (int): Number of attention heads.
-        q_proj_weight (Tensor): Query projection weights.
-        k_proj_weight (Tensor): Key projection weights.
-        v_proj_weight (Tensor): Value projection weights.
-        o_proj_weight (Tensor): Output projection weights.
-        in_features (Tensor): Input tensor of shape (batch_size, seq_len, d_model).
-        use_flash (bool): Whether to use optimized attention implementation.
-        
-    Returns:
-        Tensor: Output tensor of shape (batch_size, seq_len, d_model).
-    """
-    # Use direct einsum operations for better performance
-    batch_size, seq_len, _ = in_features.shape
-    head_dim = d_model // num_heads
-    
-    # Direct projections using einsum
-    q = einsum(in_features, q_proj_weight, '... d_in, d_out d_in -> ... d_out')
-    k = einsum(in_features, k_proj_weight, '... d_in, d_out d_in -> ... d_out')
-    v = einsum(in_features, v_proj_weight, '... d_in, d_out d_in -> ... d_out')
-    
-    # Reshape for multi-head attention: [batch_size, seq_len, d_model] -> [batch_size, num_heads, seq_len, head_dim]
-    q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
-    k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
-    v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
-    
-    # Use PyTorch's optimized scaled_dot_product_attention with causal mask
-    attn_output = F.scaled_dot_product_attention(
-        q, k, v,
-        attn_mask=None,
-        dropout_p=0.0,
-        is_causal=True  # This handles the causal masking efficiently
-    )
-    
-    # Reshape back: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, d_model]
-    attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
-    
-    # Final linear projection using direct einsum
-    output = einsum(attn_output, o_proj_weight, '... d_in, d_out d_in -> ... d_out')
-    
-    return output
 
 class MultiHeadSelfAttentionWithRoPE(torch.nn.Module):
     """
@@ -612,41 +520,7 @@ class SwiGLU(torch.nn.Module):
         # Final projection: W2(SiLU(W1x) ⊙ W3x)
         return self.w2(gated)
 
-def swiglu(
-    d_model: int,
-    d_ff: int,
-    w1_weight: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w3_weight: torch.Tensor,
-    in_features: torch.Tensor
-) -> torch.Tensor:
-    """
-    Implements the SwiGLU activation function as used in modern transformer models.
-    
-    SwiGLU(x, W1, W2, W3) = W2(SiLU(W1x) ⊙ W3x)
-    where SiLU(x) = x * σ(x) = x / (1 + exp(-x))
-    
-    Args:
-        d_model (int): The dimension of the model.
-        d_ff (int): The dimension of the feed-forward layer.
-        w1_weight (torch.Tensor): The weight matrix for the first projection of shape (d_ff, d_model).
-        w2_weight (torch.Tensor): The weight matrix for the second projection of shape (d_model, d_ff).
-        w3_weight (torch.Tensor): The weight matrix for the third projection of shape (d_ff, d_model).
-        in_features (torch.Tensor): The input tensor of shape (..., d_model).
-        
-    Returns:
-        torch.Tensor: The output tensor of shape (..., d_model).
-    """
-    # Direct projections using einsum for better performance
-    w1x = einsum(in_features, w1_weight, '... d_in, d_out d_in -> ... d_out')
-    w3x = einsum(in_features, w3_weight, '... d_in, d_out d_in -> ... d_out')
-    
-    # Apply SiLU activation to W1x and element-wise multiply with W3x
-    silu_w1x = silu(w1x)
-    gated = silu_w1x * w3x
-    
-    # Final projection: W2(SiLU(W1x) ⊙ W3x)
-    return einsum(gated, w2_weight, '... d_in, d_out d_in -> ... d_out')
+
 
 class TransformerBlock(torch.nn.Module):
     """
@@ -697,93 +571,12 @@ class TransformerBlock(torch.nn.Module):
         # Second LayerNorm (pre-norm for FFN)
         normed_res1 = self.ln2(res1)
         
-        # Feed-forward network (SwiGLU or MoE)
-        if self.use_moe:
-            ffn_output = self.ffn(normed_res1)
-            # Optionally, you can return the load balancing loss for aggregation
-            self.moe_loss = self.ffn.load_balance_loss
-        else:
-            ffn_output = self.ffn(normed_res1)
-            self.moe_loss = 0.0
+        ffn_output = self.ffn(normed_res1)
+        self.moe_loss = 0.0
         # Final residual connection
         output = res1 + ffn_output
         return output
 
-def transformer_block(
-    d_model: int,
-    num_heads: int,
-    d_ff: int,
-    max_seq_len: int,
-    theta: float,
-    weights: dict,
-    in_features: torch.Tensor
-) -> torch.Tensor:
-    """
-    Implements a single pre-norm transformer block with RoPE.
-
-    Args:
-        d_model (int): The dimension of the model.
-        num_heads (int): The number of attention heads.
-        d_ff (int): The dimension of the feed-forward layer.
-        max_seq_len (int): The maximum sequence length.
-        theta (float): The RoPE theta parameter.
-        weights (dict): A dictionary containing the weights for the transformer block.
-        in_features (torch.Tensor): The input tensor of shape (batch, seq_len, d_model).
-
-    Returns:
-        torch.Tensor: The output tensor of shape (batch, seq_len, d_model).
-    """
-    batch_size, seq_len, _ = in_features.shape
-    
-    # Extract weights
-    q_proj_weight = weights["attn.q_proj.weight"]
-    k_proj_weight = weights["attn.k_proj.weight"]
-    v_proj_weight = weights["attn.v_proj.weight"]
-    o_proj_weight = weights["attn.output_proj.weight"]
-    ln1_weight = weights["ln1.weight"]
-    ffn_w1_weight = weights["ffn.w1.weight"]
-    ffn_w2_weight = weights["ffn.w2.weight"]
-    ffn_w3_weight = weights["ffn.w3.weight"]
-    ln2_weight = weights["ln2.weight"]
-    
-    # Generate positions for RoPE
-    device = in_features.device
-    positions = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    
-    # First LayerNorm (pre-norm architecture) - use direct computation for performance
-    ln1_mean = torch.mean(in_features ** 2, dim=-1, keepdim=True)
-    ln1_rms = torch.sqrt(ln1_mean + 1e-5)
-    normed_features = (in_features / ln1_rms) * ln1_weight
-    
-    attn = MultiHeadSelfAttentionWithRoPE(d_model, num_heads, max_seq_len, theta, device=in_features.device, dtype=in_features.dtype)
-    attn.q_proj.weight.data.copy_(q_proj_weight)
-    attn.k_proj.weight.data.copy_(k_proj_weight)
-    attn.v_proj.weight.data.copy_(v_proj_weight)
-    attn.output_proj.weight.data.copy_(o_proj_weight)
-    attn_output = attn(normed_features, token_positions=positions)
-    
-    # Residual connection
-    res1 = in_features + attn_output
-    
-    # Second LayerNorm (pre-norm for FFN) - use direct computation for performance
-    ln2_mean = torch.mean(res1 ** 2, dim=-1, keepdim=True)
-    ln2_rms = torch.sqrt(ln2_mean + 1e-5)
-    normed_res1 = (res1 / ln2_rms) * ln2_weight
-    
-    # Feed-forward network with SwiGLU
-    ffn_output = swiglu(
-        d_model=d_model,
-        d_ff=d_ff,
-        w1_weight=ffn_w1_weight,
-        w2_weight=ffn_w2_weight,
-        w3_weight=ffn_w3_weight,
-        in_features=normed_res1
-    )
-    
-    # Final residual connection
-    output = res1 + ffn_output
-    
-    return output
 
 class TransformerLM(torch.nn.Module):
     """
@@ -818,16 +611,11 @@ class TransformerLM(torch.nn.Module):
         Forward pass for transformer language model with activation checkpointing.
         Returns logits. If MoE is used, you can access the total MoE loss via self.get_moe_loss().
         """
-        import torch.utils.checkpoint
         # Embedding
         x = self.token_embeddings(in_indices)
         # Process through transformer layers with checkpointing
-        self._moe_losses = []
         for layer in self.layers:
             x = layer(x)
-            # Collect MoE loss if present
-            if hasattr(layer, 'moe_loss'):
-                self._moe_losses.append(layer.moe_loss)
         # Final layer norm
         x = self.ln_final(x)
         # Language model head
