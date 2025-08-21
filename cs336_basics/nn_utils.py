@@ -68,13 +68,18 @@ class MoELayer(nn.Module):
 
         # Compute position in expert for each token (no sort, O(M+E))
         # For each expert, assign a running counter to each token assigned to it
-        pos_in_expert = torch.zeros(M, device=device, dtype=torch.long)
-        # For each expert, fill in positions for its tokens
-        # 1. Get indices for each expert
-        for e in range(self.num_experts):
-            idx = (expert_idx_flat == e).nonzero(as_tuple=True)[0]
-            if idx.numel() > 0:
-                pos_in_expert[idx] = torch.arange(idx.numel(), device=device)
+        # Vectorized assignment of position in expert for each token
+        # Sort expert_idx_flat to group tokens by expert
+        sorted_expert, sort_idx = expert_idx_flat.sort(stable=True)
+        # Count tokens per expert
+        counts = torch.bincount(sorted_expert, minlength=self.num_experts)
+        # Create position indices within each expert
+        pos_in_sorted = torch.arange(M, device=device) - torch.cumsum(
+            torch.cat([torch.zeros(1, device=device, dtype=counts.dtype), counts[:-1]]), dim=0
+        )[sorted_expert]
+        # Unsort to original order
+        pos_in_expert = torch.empty_like(pos_in_sorted)
+        pos_in_expert[sort_idx] = pos_in_sorted
         keep = pos_in_expert < max_capacity[expert_idx_flat]
 
         token_idx_flat = token_idx_flat[keep]

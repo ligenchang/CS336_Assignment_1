@@ -224,7 +224,7 @@ def get_dataset_defaults(dataset_name):
             'batch_size': 16,         # Keep batch size reasonable for memory
             'num_steps': 160000,      # Keep Chinchilla token budget
             'accumulation_steps': 8,  # Reasonable for this size
-            'base_lr': 2e-4,          # Standard LR for GPT-2/3
+            'base_lr': 4e-4,          # Standard LR for GPT-2/3
             'min_lr': 1e-5,           # Proportionally lower min LR
             'max_grad_norm': 1.0,
             'rope_theta': 10000

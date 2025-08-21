@@ -89,6 +89,7 @@ def main():
     parser.add_argument('--top_p', type=float, default=1.0, help='Top-p (nucleus) sampling threshold (0.0-1.0, default: 1.0=no filtering)')
     parser.add_argument('--top_k', type=int, default=None, help='Top-k sampling (keep only k most likely tokens; default: None)')
     parser.add_argument('--weights_only', action='store_true', help='Load checkpoint as weights-only (model.state_dict)')
+    parser.add_argument('--repetition_penalty', type=float, default=1.0, help='Penalty for repeated tokens (>1.0 discourages repetition, default: 1.0)')
     args = parser.parse_args()
 
     # Dataset-specific defaults - match train.py exactly
@@ -243,6 +244,13 @@ def main():
         with torch.no_grad():
             logits = model(x)
         next_token_logits = logits[0, len(input_ids)-1].float()
+        # Apply repetition penalty
+        if args.repetition_penalty != 1.0 and len(generated) > 0:
+            for token_id in set(generated):
+                if next_token_logits[token_id] > 0:
+                    next_token_logits[token_id] /= args.repetition_penalty
+                else:
+                    next_token_logits[token_id] *= args.repetition_penalty
         probs = softmax_with_temperature(next_token_logits, args.temperature)
         # Apply top_k and top_p sampling in sequence if specified
         if args.top_k is not None and args.top_k > 0:
